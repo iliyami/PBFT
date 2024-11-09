@@ -31,9 +31,10 @@ class PaxosServer:
         self.view = 1
         self.accepted_value = None
         self.accepted_number = None
+        self.prepared = None
         self.message = None
         self.signatures = []
-        self.transaction_queue = Queue()
+        self.transaction_queue = []
         self.total_transaction_time = 0  # Total time spent processing transactions
         self.total_transactions_committed = 0  # Count of committed transactions
         self.start_time = time.time() # Server start time (for transactions per second)
@@ -49,12 +50,13 @@ class PaxosServer:
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS transactions
-                               (sequence_number INTEGER PRIMARY KEY,
-                                sender INTEGER,
-                                receiver INTEGER,
+                               (id INTEGER PRIMARY KEY,
+                                sequence_number int,
+                                sender int,
+                                receiver int,
                                 amount INTEGER,
-                                ballot_number INTEGER,
-                                process_id INTEGER)''')
+                                view INTEGER,
+                                status TEXT)''')
         self.conn.commit()
         # self.transactions_log = []
         # self.local_major_block = []
@@ -67,19 +69,16 @@ class PaxosServer:
     def close(self):
         self.conn.close()
 
-    def add_transaction_to_datastore(self, block, ballot):
-        ballot_number, process_id = ballot
+    def add_transaction_to_datastore(self, message, accepted_number, status):
+        v, n = accepted_number
         new_curstor = self.conn.cursor()
-        data_to_insert = []
-        for transaction in block:
-            sequence_number, details = transaction[0], transaction[1]
-            sender, receiver, amount = details
-            data_to_insert.append((sequence_number, sender, receiver, amount, ballot_number, process_id))
+        id, transaction = message
+        sender, receiver, amount = transaction
 
-        new_curstor.executemany('''
-            INSERT OR IGNORE INTO transactions (sequence_number, sender, receiver, amount, ballot_number, process_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', data_to_insert)
+        new_curstor.execute('''
+            INSERT OR IGNORE INTO transactions (id, sequence_number, sender, receiver, amount, view, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (id, n, sender, receiver, amount, v, status))
             
         if new_curstor.rowcount > 0:
             self.conn.commit()
@@ -91,22 +90,39 @@ class PaxosServer:
         self.conn.commit()
 
         for transaction in new_datastore:
-            sequence_number, sender, receiver, amount, ballot_number, process_id = transaction
+            id, sequence_number, sender, receiver, amount, ballot_number, process_id = transaction
 
             self.cursor.execute('''
-                INSERT OR IGNORE INTO transactions (sequence_number, sender, receiver, amount, ballot_number, process_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (sequence_number, sender, receiver, amount, ballot_number, process_id))
+                INSERT OR IGNORE INTO transactions (id, sequence_number, sender, receiver, amount, ballot_number, process_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (id, sequence_number, sender, receiver, amount, ballot_number, process_id))
 
         self.conn.commit()
         # print(f"Server {self.server_id}: Replaced the datastore with the new given datastore.")
 
     def get_all_transactions(self):
         new_cursor = self.conn.cursor()
-        new_cursor.execute('SELECT * FROM transactions')
+        new_cursor.execute('SELECT * FROM transactions ORDER BY sequence_number ASC')
         transactions = new_cursor.fetchall()
         return transactions
         
+    def get_transactions_by_status(self, status):
+        new_cursor = self.conn.cursor()
+        new_cursor.execute('''SELECT * FROM transactions
+                       WHERE status = ?
+                       ORDER BY sequence_number ASC''', (status,))
+        transactions = new_cursor.fetchall()
+        new_cursor.close()
+
+        return transactions
+    
+    def update_transaction_status(self, sequence_number, new_status):
+        new_cursor = self.conn.cursor()
+        new_cursor.execute("UPDATE transactions SET status = ? WHERE sequence_number = ?", (new_status, sequence_number))
+        self.conn.commit()
+        new_cursor.close()
+
+
     def start_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -154,26 +170,26 @@ class PaxosServer:
         client = payload['client']
         transaction = payload['transaction']
         self.live_servers = payload['live_servers']
+
+        for request in self.transaction_queue:
+            queued_request_timestamp = request['client']['timestamp']
+            new_request_timestamp = client['timestamp']
+            if queued_request_timestamp == new_request_timestamp:
+                return
             
         if PaxosServer.pending_pbft:
-            print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
-            self.transaction_queue.put(transaction)
+            # print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
+            self.transaction_queue.append(payload)
             return
         
-        print(f"Server {self.server_id}: Queuing transaction {transaction}.")
-        self.transaction_queue.put(transaction)
+        # print(f"Server {self.server_id}: Queuing transaction {transaction}.")
+        # self.transaction_queue.put(transaction)
         seq_num, trans = transaction
         sender, receiver, amount = trans
         self.check_balance(sender)
-        if self.balances[sender] >= amount:
-            # self.transaction_queue.put(transaction)
-            self.initiate_pbft(client, trans)
-        else:
-            print('=========== ERROR - LOW Balanace ============')
-        #     # Process the transaction locally and update log
-            # self.balances[sender] -= amount
-            # self.transactions_log.append(transaction)
-            # print(f"Server {self.server_id}: Processed transaction {transaction}")
+        # print(f'initializinggggggggggggggg PBFT for req {payload}')
+        self.initiate_pbft(client, transaction)
+
 
     def handle_paxos_message(self, paxos_message):
         paxos_type = paxos_message['type']
@@ -207,7 +223,7 @@ class PaxosServer:
         self.accept_majority_reached = False
 
         # Send PRE-PREPARE message to all peers
-        n = self.assign_n()
+        n = PaxosServer.assign_n()
         d = self.digest(transaction)
         self.view = self.server_id
         self.accepted_number = (self.server_id, n)
@@ -219,6 +235,7 @@ class PaxosServer:
             'd': d,
             'm': transaction,
             'client': client,
+            's': self.get_node_signature(self.server_id)
         }}
         self.broadcast_message(message)
         self.wait_for_majority()
@@ -240,6 +257,7 @@ class PaxosServer:
         if isValid:
             self.view = v
             self.accepted_number = (v, n)
+            # print(f'server {self.server_id} acc num is {self.accepted_number} for n {n}')
             self.accepted_value = d
             self.message = m
              # Send PREPARE message to the collector (leader)
@@ -255,15 +273,14 @@ class PaxosServer:
         else:
             print('PP Is nottttttttttttttttttttttttttttttt valiiiiiiiiiid')
 
-    def send_prepare(self, port, message):
-        self.send_message(port, message)
-
     def handle_prepare(self, message):
         signature = message['s']
-
+        
+        # print(f'Receiving prepare by leader with payload: {message}')
         with self.response_lock:
             self.majority_responses += 1
             self.signatures.append(signature)
+            # print(f'Receiving prepare by leader with payload: {message}')
             if self.majority_responses >= MAJORITY:
                 # Majority reached, send ACCEPT message
                 start_time = time.time()
@@ -273,7 +290,9 @@ class PaxosServer:
                     self.response_lock.acquire()
                 self.majority_reached = True
                 self.majority_responses = 1
+                # print('======================here\n',self.response_lock)
                 self.condition.notify()
+                # print('======================here\n',self.response_lock)
 
     def wait_for_majority(self, timeout=2):
         """Wait for majority of prepare responses or timeout"""
@@ -283,22 +302,35 @@ class PaxosServer:
             if self.majority_reached:
                 # print(f"Server {self.server_id}: Majority of promises received, proceeding to send accept.")
                 self.majority_reached = False
+                self.majority_responses = 1
+                # print('======================here\n',self.response_lock)
+                # if self.response_lock.locked():
+                #     self.response_lock.release()
+                # print(f'send prepare ack for {self.accepted_number}')
                 self.send_prepare_ack()
             else:
-                # print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
+                print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
                 self.majority_reached = False 
+                self.majority_responses = 1
+
 
     def send_prepare_ack(self):
-        live_ports = [server + 5000 for server in self.live_servers if server != self.server_id]
         message = {'paxos': {
                 'type': 'prepare_ack',
+                'v': self.server_id,
+                'n': self.accepted_number[1],
                 'certificate': self.signatures,
             }}
         self.broadcast_message(message)
+        self.wait_for_accepted_majority()
+
 
     def handle_prepare_ack(self, message):
         signatures = message['certificate']
-        isValid = len(signatures) >= MAJORITY
+        v = message['v']
+        n = message['n']
+
+        isValid = len(signatures) >= MAJORITY and (self.accepted_number != None or self.accepted_number == (v, n))
         if isValid == False:
             return
 
@@ -307,14 +339,15 @@ class PaxosServer:
         message = {'paxos': {
             'type': 'commit',
             'v': self.view,
+            'n': self.accepted_number[1],
             'd': self.accepted_value,
             'i': self.server_id,
             's': self.get_node_signature(self.server_id)
         }}
+        self.prepared = (self.accepted_number[0], self.accepted_number[1], self.accepted_value)
         self.send_message(leader_port, message)
-        self.wait_for_accepted_majority()
 
-    def wait_for_accepted_majority(self, timeout=2):
+    def wait_for_accepted_majority(self, timeout=3):
         """Wait for majority of accepted responses or timeout"""
         with self.accept_condition:
             # Wait until a majority of accepted messages is received or the timeout occurs
@@ -323,34 +356,45 @@ class PaxosServer:
                 # Commit the transaction after majority or timeout
                 self.accept_majority_reached = False
                 self.accept_majority_responses = 1
-                PaxosServer.pending_pbft = False
                 self.commit_transaction()
-                # print(f"Server {self.server_id}: Majority of accepted responses received, committing transaction.")
-            # else:
-                # print(f"Server {self.server_id}: Timeout reached, proceeding with available accepted responses.")
+                # print(f"Server {self.server_id}: Majority reached, committing request {self.message} .")
+            else:
+                print(f"Server {self.server_id}: Timeout reached for the commit majority!")
+                self.accept_majority_reached = False
+                self.accept_majority_responses = 1
 
 
     def handle_commit(self, message):
         with self.accept_response_lock:
+                d = message['d']
+                n = message['n']
+                v = message['v']
+                s = message['s']
+                if (v, n) != self.accepted_number or d != self.accepted_value:
+                    return
+                
                 self.accept_majority_responses += 1
-                # print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
+                # print(f"Server {self.server_id}: Received commit request with s {s}")
 
                 if self.accept_majority_responses >= MAJORITY:
-                    self.accept_majority_responses = 1
                     self.accept_majority_reached = True
                     self.accept_condition.notify()
-                    # print(f"Server {self.server_id}: Reached majority, committing block {major_block}")
+                    # print(f"Server {self.server_id}: Reached majority, committing request {message}")
 
     def commit_transaction(self):
         # Commit the block locally
         start_time = time.time()
-        self.add_transaction_to_datastore(self.message, self.accepted_number)
+        self.add_transaction_to_datastore(self.message, self.accepted_number, 'C')
         # self.clear_outdated_logs(unique_major_block)
 
         # Update performance metrics
         processing_time = time.time() - start_time  # Calculate processing time
         self.total_transaction_time += processing_time
         self.total_transactions_committed += 1
+
+        # Execution
+        client_id = self.message[1][0]
+        self.execute_transaction(client_id)
 
         # Broadcast COMMIT_ACK message to all other servers
         live_ports = [server + 5000 for server in self.live_servers if server != self.server_id]
@@ -365,25 +409,66 @@ class PaxosServer:
             }
         }
         self.broadcast_message(message)
-        self.handle_consensus_completion()
+        # print(f'handling post consensusssssssssssssssssss n = {self.accepted_number[1]}')
+        threading.Timer(0.2, self.handle_consensus_completion).start()
+
+    def execute_transaction(self, client_id):
+        transactions = self.get_all_transactions()
+        commited = []
+        executed = []
+        for trans in transactions:
+            id, n, sender, receiver, amount, view, status = trans
+            if status == 'C':
+                commited.append(trans)
+            elif status == 'E':
+                executed.append(trans)
+
+        if len(commited) == 0:
+            self.send_message(client_id+8000, message = {'reply': 'yes'})
+            return
+
+        for commit in commited:
+            last_exec_n = 0 if len(executed) == 0 else executed[-1][1]
+            id, n, sender, receiver, amount, view, status = commit
+            if last_exec_n + 1 == n:
+                print(f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})")
+                self.balances[sender] -= amount
+                self.balances[receiver] += amount
+                executed.append(commit)
+                self.update_transaction_status(n, 'E')
+                client_port = sender + 8000
+                self.send_message(client_port, message = {'reply': 'yes'})
+
 
     def handle_commit_ack(self, message):
+        v = message['v']
+        n = message['n']
+        d = message['d']
+        if self.prepared != (v, n, d):
+            # print(f'No Prepared for {self.server_id} with n={n} d={d}!!!!!!!!!!')
+            return
+        # print(f'messageeeeeeeeeeeeeeeee server {self.server_id}: {message}')
         # Commit the major block to the datastore
-        self.add_transaction_to_datastore(self.message, self.accepted_number)
+        self.add_transaction_to_datastore(self.message, self.accepted_number, 'C')
+        # Execution
+        client_id = self.message[1][0]
+        self.execute_transaction(client_id)
         # self.clear_outdated_logs(major_block) 
-        self.handle_consensus_completion()
+        self.reset_local_values()
 
     def assign_n():
         PaxosServer.round_number += 1
         return PaxosServer.round_number
 
     def digest(self, message):
-        hash_object = hashlib.sha256(message.encode())
+        value = str(message)
+        hash_object = hashlib.sha256(value.encode())
         hash_hex = hash_object.hexdigest()
         return hash_hex
     
     def get_node_signature(self, server_id):
-        hash_object = hashlib.sha256(server_id.encode())
+        value = str(server_id)
+        hash_object = hashlib.sha256(value.encode())
         hash_hex = hash_object.hexdigest()
         return hash_hex
     
@@ -501,10 +586,10 @@ class PaxosServer:
         return next((item for item in self.peers if item % 1000 == sender_id), None)
 
     def calculate_balance(self, client):
-        all_transactions = self.transactions_log.copy()
-        datastore = self.get_all_transactions()
+        all_transactions = []
+        datastore = self.get_transactions_by_status('E')
         for trans in datastore:
-            sequence_number, sender, receiver, amount, ballot_number, process_id = trans
+            id, sequence_number, sender, receiver, amount, ballot_number, process_id = trans
             all_transactions.append([sequence_number, [sender, receiver, amount]])
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
 
@@ -520,11 +605,17 @@ class PaxosServer:
         return self.balances[client]
 
     def handle_consensus_completion(self):
+        self.reset_local_values()
+        PaxosServer.pending_pbft = False
+        self.process_queued_transactions()
+
+    def reset_local_values(self):
+        # print(f'server {self.server_id} is reseting! n = {self.accepted_number[1]} d = {self.accepted_value}')
         self.accepted_number = None
         self.accepted_value = None
+        self.prepared = None
         self.message = None
         self.signatures = []
-        self.process_queued_transactions()
     
     def check_balance(self, client):
         self.calculate_balance(client)
@@ -538,10 +629,10 @@ class PaxosServer:
             peer_socket.close()
 
     def process_queued_transactions(self):
-        while not self.transaction_queue.empty():
-            transaction = self.transaction_queue.get()
-            print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
-            self.handle_transaction({'transaction': transaction, 'live_servers': self.live_servers})
+        if self.transaction_queue:
+            payload = self.transaction_queue.pop(0)
+            # print(f"Server {self.server_id}: Processing queued transaction {payload}.")
+            self.handle_transaction(payload)
 
     def get_missing_blocks(self):
         return self.get_all_transactions()
