@@ -62,6 +62,8 @@ class PBFTClient():
             leader_port = 5000 + Shared.leader_id
             sock.connect((self.primary_server_host, leader_port))
             sock.sendall(json.dumps(request).encode())
+            self.response_lock = threading.Lock()
+            self.condition = threading.Condition(self.response_lock)
             self.wait_for_replies(request=request)
         except ConnectionRefusedError:
             print(f"Error: Could not connect to client on port {leader_port}. Is the client running?")
