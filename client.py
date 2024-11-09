@@ -40,33 +40,19 @@ class PBFTClient():
             self.send_request(request)
         elif 'reply' in request:
             self.handle_reply(request)
-        # elif'command' in request:
-        #     self.handle_command(request['command'])
-    def handle_reply(self):
-        self.replies_received += 1
-        if self.replies_received >= 3:
-            self.condition.notify()
 
-    # def listen_for_replies(self):
-    #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-    #         server_socket.bind((self.client_host, self.port))
-    #         server_socket.listen(5)
-    #         print(f"Client {self.client_id} listening for replies on port {self.port}...")
+    def handle_reply(self, request):
+        with self.response_lock:
+            if request['reply'] == 'no':
+                return
+            self.replies_received += 1
+            if self.replies_received >= 3:
+                self.condition.notify()
 
-    #         while True:l
-    #             conn, addr = server_socket.accept()
-    #             with conn:
-    #                 data = conn.recv(1024).decode()
-    #                 if data:
-    #                     print(f"Client {self.client_id} received reply: {data}")
-    #                     self.replies_received += 1
-    #                     if self.replies_received >= 3:
-    #                         print(f"Client {self.client_id} received {self.replies_received} confirmations.")
-    #                         return
 
     def send_request(self, request):
         try:
-            if request['client'] == None:
+            if 'client' not in request:
                 request['client'] = {
                     'id': self.client_id,
                     'signature': self.signature,
@@ -77,7 +63,6 @@ class PBFTClient():
             sock.connect((self.primary_server_host, leader_port))
             sock.sendall(json.dumps(request).encode())
             self.wait_for_replies(request=request)
-            # print(f'Sending request ${request}')
         except ConnectionRefusedError:
             print(f"Error: Could not connect to client on port {leader_port}. Is the client running?")
         except Exception as e:
@@ -85,33 +70,20 @@ class PBFTClient():
         finally:
             sock.close()
 
-        # attempt = 0
-        # while self.replies_received < 3:
-        #     print(f"Client {self.client_id} sending transaction {request}, attempt {attempt}...")
-
-        #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        #         leader_port = 5000 + Shared.leader_id - 1
-        #         sock.connect((self.primary_server_host, leader_port))
-        #         sock.sendall(json.dumps(request).encode())
-
-        #     time.sleep(self.retry_timeout)
-
-    def wait_for_replies(self, request, timeout=2):
+    def wait_for_replies(self, request, timeout=5):
         """Wait for f+1 responses or timeout"""
         with self.condition:
             self.condition.wait_for(lambda: self.replies_received >= 3, timeout=timeout)
             if self.replies_received >= 3:
                 print(f"Client {self.client_id}: f+1 of replies received.")
                 self.replies_received = 0
-                # self.condition.release()
             else:
                 print(f"Client {self.client_id}: Timeout reached, Resending the request!")
                 self.replies_received = 0
-                # if self.response_lock.locked():
-                    # self.condition.release()
-                # self.send_request(request)
+                self.send_request(request)
 
-def generate_signature(self, server_id):
-    hash_object = hashlib.sha256(server_id.encode())
+def generate_signature(server_id):
+    value = str(server_id)
+    hash_object = hashlib.sha256(value.encode())
     hash_hex = hash_object.hexdigest()
     return hash_hex
