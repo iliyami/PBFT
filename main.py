@@ -18,15 +18,15 @@ F = (NUM_SERVERS - 1) // 3  # BPFT F
 MAJORITY = 2*F + 1 #BPFT requires majority for prepare*, commit and checkpoint
 
 
-# Sample server class handling TCP connections and Paxos protocol
-class PaxosServer:
+# Sample server class handling TCP connections and PBFT protocol
+class PbftServer:
     round_number = 0
-    pending_pbft = False
     def __init__(self, server_id, port, peers, db_file):
         self.server_id = server_id
         self.port = port
         self.live_servers = []
         self.peers = peers
+        self.pending_pbft = False
         self.balances = {key: 10 for key in range(1, NUM_CLIENTS + 1)}
         self.view = 1
         self.accepted_value = None
@@ -46,6 +46,12 @@ class PaxosServer:
         self.accept_response_lock = threading.Lock()
         self.condition = threading.Condition(self.response_lock)  # Condition to wait for responses
         self.accept_condition = threading.Condition(self.accept_response_lock)  # Separate condition for accepted phase
+        self.view_timeout = 4
+        self.view_cancel_timeout = 2.5
+        self.view_timer = None  # Timer for tracking the leader's response time
+        self.vc_request_timer = None #Timer for tracking the view change request to cancel non-majority reached vc reqs
+        self.view_change_pending = False
+        self.vc_signatures = []
 
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
@@ -58,12 +64,6 @@ class PaxosServer:
                                 view INTEGER,
                                 status TEXT)''')
         self.conn.commit()
-        # self.transactions_log = []
-        # self.local_major_block = []
-        # self.ballot_number = 0
-        # self.is_leader = False
-        # self.last_committed_block = (0, 0)
-        # self.promised_number = 0
 
 
     def close(self):
@@ -139,16 +139,16 @@ class PaxosServer:
             threading.Thread(target=self.handle_client, args=(client_conn,)).start()
 
     def handle_client(self, conn):
-        data = conn.recv(1024).decode()
+        data = conn.recv(2048).decode()
         request = json.loads(data)
         if 'transaction' in request:
             self.handle_transaction(request)
-        elif 'paxos' in request:
-            self.handle_paxos_message(request['paxos'])
+        elif 'pbft' in request:
+            self.handle_pbft_message(request['pbft'])
         elif'command' in request:
             self.handle_commands(request['command'])
 
-    # ------------- Paxos Phases ----------------- #
+    # ------------- PBFT Phases ----------------- #
     def handle_commands(self, command):
         command_type = command['type']
         if command_type == 'client_balance_request':
@@ -171,14 +171,21 @@ class PaxosServer:
         transaction = payload['transaction']
         self.live_servers = payload['live_servers']
 
-        for request in self.transaction_queue:
-            queued_request_timestamp = request['client']['timestamp']
+        if self.view != self.server_id:
+            self.view_timer = threading.Timer(self.view_timeout, self.view_change_request, args=('I', ))
+            self.view_timer.start()
+
+        if self.view != self.server_id:
+            return
+
+        if self.pending_pbft:
+            # print(f"Server {self.server_id}: PBFT is in progress. Queuing transaction {transaction}.")
             new_request_timestamp = client['timestamp']
-            if queued_request_timestamp == new_request_timestamp:
-                return
+            for request in self.transaction_queue:
+                queued_request_timestamp = request['client']['timestamp']
+                if queued_request_timestamp == new_request_timestamp:
+                    return
             
-        if PaxosServer.pending_pbft:
-            # print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
             self.transaction_queue.append(payload)
             return
         
@@ -187,34 +194,42 @@ class PaxosServer:
         seq_num, trans = transaction
         sender, receiver, amount = trans
         self.check_balance(sender)
-        # print(f'initializinggggggggggggggg PBFT for req {payload}')
         self.initiate_pbft(client, transaction)
 
 
-    def handle_paxos_message(self, paxos_message):
-        paxos_type = paxos_message['type']
-        if paxos_type == 'preprepare':
-            self.handle_pre_prepare(paxos_message)
-        elif paxos_type == 'prepare':
-            self.handle_prepare(paxos_message)
-        elif paxos_type == 'prepare_ack':
-            self.handle_prepare_ack(paxos_message)
-        elif paxos_type == 'commit':
-            self.handle_commit(paxos_message)
-        elif paxos_type == 'commit_ack':
-            self.handle_commit_ack(paxos_message)
-        elif paxos_type == 'catch_up_request':
-            self.handle_catch_up_request(paxos_message)
-        elif paxos_type == 'catch_up_response':
-            self.handle_catch_up_response(paxos_message)
+    def handle_pbft_message(self, pbft_message):
+        pbft_type = pbft_message['type']
+        if pbft_type == 'view_change':
+            self.handle_view_change(pbft_message)
+        elif pbft_type == 'new_view':
+            self.handle_new_view(pbft_message)
+            
+        if self.view_change_pending == False:
+            if pbft_type == 'preprepare':
+                self.handle_pre_prepare(pbft_message)
+            elif pbft_type == 'prepare':
+                self.handle_prepare(pbft_message)
+            elif pbft_type == 'prepare_ack':
+                self.handle_prepare_ack(pbft_message)
+            elif pbft_type == 'commit':
+                self.handle_commit(pbft_message)
+            elif pbft_type == 'commit_ack':
+                self.handle_commit_ack(pbft_message)
+            elif pbft_type == 'catch_up_request':
+                self.handle_catch_up_request(pbft_message)
+            elif pbft_type == 'catch_up_response':
+                self.handle_catch_up_response(pbft_message)
 
-    def broadcast_message(self, message):
+    def broadcast_message(self, message, include_self=False):
         live_ports = [server + 5000 for server in self.live_servers if server != self.server_id]
+        if include_self:
+            live_ports.append(self.server_id+5000)
         for peer_port in live_ports:
                 self.send_message(peer_port, message) 
 
     def initiate_pbft(self, client, transaction):
-        PaxosServer.pending_pbft = True
+        print(f'initiating PBFT by {self.server_id} for trans {transaction}')
+        self.pending_pbft = True
         self.message = transaction
         self.signatures = []
         self.majority_responses = 1
@@ -223,12 +238,12 @@ class PaxosServer:
         self.accept_majority_reached = False
 
         # Send PRE-PREPARE message to all peers
-        n = PaxosServer.assign_n()
+        n = PbftServer.assign_n()
         d = self.digest(transaction)
         self.view = self.server_id
         self.accepted_number = (self.server_id, n)
         self.accepted_value = d
-        message = {'paxos': {
+        message = {'pbft': {
             'type': 'preprepare',
             'v': self.view,
             'n': n,
@@ -240,6 +255,81 @@ class PaxosServer:
         self.broadcast_message(message)
         self.wait_for_majority()
 
+    def view_change_request(self, dest):
+        if self.view_timer == None:
+            return
+        self.view_change_pending = True
+        self.vc_request_timer = threading.Timer(self.view_cancel_timeout, self.cancel_view_change)
+        self.vc_request_timer.start()
+        new_view = self.new_view()
+        message = {'pbft': {
+            'type': 'view_change',
+            'v': new_view,
+            # 'n': latest_checkpoint,
+            # 'C': checkpoints,
+            'i': self.server_id,
+            's': self.get_node_signature(self.server_id)
+        }}
+        print(f'\nServer {self.server_id}: view change requested for v={new_view} from {dest} for thread {self.view_timer.name}')
+        self.broadcast_message(message, include_self=True)
+
+    def handle_view_change(self, message):
+        v = message['v']
+        if self.server_id == v:
+            self.vc_signatures.append(message)
+            if len(self.vc_signatures) >= F + 1:
+                message = {'pbft': {
+                'type': 'new_view',
+                'v': v,
+                'v_signatures': self.vc_signatures.copy(),
+                # 'O': self.O
+                's': self.get_node_signature(self.server_id)
+                }}
+                # print(f'\nServer {self.server_id}: New view requested by designated node {v}!')
+                self.broadcast_message(message, include_self=True)
+                threading.Timer(0.2, self.on_new_view_replaced).start()
+
+    def on_new_view_replaced(self):
+        self.pending_pbft = False
+
+    def handle_new_view(self, message):
+        v = message['v']
+        self.view = v
+        self.vc_signatures = []
+        self.cancel_view_change()
+        print(f'\nServer {self.server_id}: New view applied! v={self.view}')
+
+    def reset_view_timer(self, dest):
+        if self.vc_request_timer != None:
+            self.vc_request_timer.cancel()
+            self.vc_request_timer = None
+        if self.view_timer != None:
+            self.view_timer.cancel()
+            self.view_timer = None
+        self.view_timer = threading.Timer(self.view_timeout, self.view_change_request, (dest,))
+        self.view_timer.start()
+        # print(f'Server {self.server_id}: resetting from {dest} with thread {self.view_timer.name} ')
+
+    def cancel_view_change(self):
+        self.view_change_pending = False
+        if self.vc_request_timer != None:
+            self.vc_request_timer.cancel()
+            self.vc_request_timer = None
+        if self.view_timer != None:
+            self.view_timer.cancel()
+            self.view_timer = None
+        # print(f'\nServer {self.server_id}: cancelled!')
+
+    def new_view(self):
+        new_view = -1
+        view = self.view
+        while new_view == -1 or new_view not in self.live_servers:
+            new_view = view+1%(NUM_SERVERS+1)
+            if new_view == 0:
+                new_view = 1
+            view += 1
+        return new_view
+    
     def handle_pre_prepare(self, message):
         n = message['n']
         v = message['v']
@@ -255,14 +345,15 @@ class PaxosServer:
             self.accepted_number == None or (self.accepted_number == (v, n) and self.accepted_value == d))
 
         if isValid:
+            self.reset_view_timer('PP')
             self.view = v
             self.accepted_number = (v, n)
             # print(f'server {self.server_id} acc num is {self.accepted_number} for n {n}')
             self.accepted_value = d
             self.message = m
              # Send PREPARE message to the collector (leader)
-            leader_port = 5000+Shared.leader_id
-            message = {'paxos': {
+            leader_port = 5000+self.view
+            message = {'pbft': {
             'type': 'prepare',
             'v': v,
             'n': n,
@@ -309,13 +400,13 @@ class PaxosServer:
                 # print(f'send prepare ack for {self.accepted_number}')
                 self.send_prepare_ack()
             else:
-                print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
+                print(f"Server {self.server_id}: Timeout reached, aborting PBFT.")
                 self.majority_reached = False 
                 self.majority_responses = 1
 
 
     def send_prepare_ack(self):
-        message = {'paxos': {
+        message = {'pbft': {
                 'type': 'prepare_ack',
                 'v': self.server_id,
                 'n': self.accepted_number[1],
@@ -326,6 +417,8 @@ class PaxosServer:
 
 
     def handle_prepare_ack(self, message):
+        self.reset_view_timer('Prepare Ack')
+
         signatures = message['certificate']
         v = message['v']
         n = message['n']
@@ -335,8 +428,8 @@ class PaxosServer:
             return
 
          # Send Commit message to the collector (leader)
-        leader_port = 5000+Shared.leader_id
-        message = {'paxos': {
+        leader_port = 5000+self.view
+        message = {'pbft': {
             'type': 'commit',
             'v': self.view,
             'n': self.accepted_number[1],
@@ -399,7 +492,7 @@ class PaxosServer:
         # Broadcast COMMIT_ACK message to all other servers
         live_ports = [server + 5000 for server in self.live_servers if server != self.server_id]
         message = {
-            'paxos': {
+            'pbft': {
                 'type': 'commit_ack',
                 'v': self.view,
                 'n': self.accepted_number[1],
@@ -424,23 +517,30 @@ class PaxosServer:
                 executed.append(trans)
 
         if len(commited) == 0:
-            self.send_message(client_id+8000, message = {'reply': 'yes'})
+            self.reply_client(client_id, 'yes')
             return
 
         for commit in commited:
             last_exec_n = 0 if len(executed) == 0 else executed[-1][1]
             id, n, sender, receiver, amount, view, status = commit
-            if last_exec_n + 1 == n:
+            if last_exec_n + 1 <= n:
                 print(f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})")
                 self.balances[sender] -= amount
                 self.balances[receiver] += amount
                 executed.append(commit)
                 self.update_transaction_status(n, 'E')
-                client_port = sender + 8000
-                self.send_message(client_port, message = {'reply': 'yes'})
+                self.reply_client(sender, 'yes')
+            else:
+                self.reset_view_timer('Else C')
+
+    def reply_client(self, client_id, msg):
+        self.cancel_view_change()
+        self.send_message(client_id+8000, message = {'reply': msg, 'v': self.view})
 
 
     def handle_commit_ack(self, message):
+        self.reset_view_timer('C')
+
         v = message['v']
         n = message['n']
         d = message['d']
@@ -457,8 +557,8 @@ class PaxosServer:
         self.reset_local_values()
 
     def assign_n():
-        PaxosServer.round_number += 1
-        return PaxosServer.round_number
+        PbftServer.round_number += 1
+        return PbftServer.round_number
 
     def digest(self, message):
         value = str(message)
@@ -481,7 +581,7 @@ class PaxosServer:
     def request_missing_blocks(self, leader_id, last_committed_block, requester_lcb):
         """Request missing blocks from the leader to catch up."""
         request_message = {
-            'paxos': {
+            'pbft': {
                 'type': 'catch_up_request',
                 'sender_id': self.server_id,
                 'last_committed_block': last_committed_block,
@@ -497,7 +597,7 @@ class PaxosServer:
         # Find the missing blocks and send them to the requester
         missing_blocks = self.get_missing_blocks()
         response_message = {
-            'paxos': {
+            'pbft': {
                 'type': 'catch_up_response',
                 'sender_id': self.server_id,
                 'missing_blocks': missing_blocks,
@@ -606,7 +706,7 @@ class PaxosServer:
 
     def handle_consensus_completion(self):
         self.reset_local_values()
-        PaxosServer.pending_pbft = False
+        self.pending_pbft = False
         self.process_queued_transactions()
 
     def reset_local_values(self):
@@ -685,7 +785,7 @@ def read_input_file(filename):
     return test_sets
 
 def start_client(client_id, port):
-    client = PBFTClient(client_id, port)
+    client = PBFTClient(client_id, port, NUM_SERVERS)
     client.start_client()
     clients.append(client)
 
@@ -694,7 +794,7 @@ def start_server(server_id, port, peers):
     # Remove the existing database file if it exists
     if os.path.exists(db_file):
         os.remove(db_file)
-    server = PaxosServer(server_id, port, peers, db_file=db_file)
+    server = PbftServer(server_id, port, peers, db_file=db_file)
     server.start_server()
     return server
 
@@ -763,16 +863,16 @@ for set_number, test_data in test_sets.items():
     
     for transaction in transactions:
         client_id = transaction[1][0]  # S is the sender, which determines the client
-        leader_port = 5000 + Shared.leader_id
+        # leader_port = 5000 + Shared.leader_id
         
         # If the server is in the live_servers, send the transaction to that server
-        if leader_port%1000 in live_servers:
-            # print(f"Sending request to client {client_id}")
-            client = clients[client_id - 1]
-            request = {'transaction': transaction, 'live_servers': live_servers}
-            send_request_to_client(client_id+8000, request)
-        else:
-            print(f"Server {leader_port} is down, skipping transaction {transaction}")
+        # if leader_port%1000 in live_servers:
+        # print(f"Sending request to client {client_id}")
+        client = clients[client_id - 1]
+        request = {'transaction': transaction, 'live_servers': live_servers}
+        send_request_to_client(client_id+8000, request)
+        # else:
+        #     print(f"Server {leader_port} is down, skipping transaction {transaction}")
     
     while True:
         user_input = input(
