@@ -6,15 +6,17 @@ import time
 from shared import Shared
 
 class PBFTClient():
-    def __init__(self, client_id, client_port):
+    def __init__(self, client_id, client_port, server_counts):
         super().__init__()
         self.client_id = client_id
+        self.server_counts = server_counts
         self.signature = generate_signature(client_id)
         self.client_host = 'localhost'
         self.port = client_port
         self.primary_server_host = 'localhost'
-        self.retry_timeout = 5
+        self.attempts = 0
         self.replies_received = 0
+        self.view = 1
         self.response_lock = threading.Lock()
         self.condition = threading.Condition(self.response_lock)
 
@@ -47,6 +49,7 @@ class PBFTClient():
                 return
             self.replies_received += 1
             if self.replies_received >= 3:
+                self.view = request['v']
                 self.condition.notify()
 
 
@@ -58,10 +61,13 @@ class PBFTClient():
                     'signature': self.signature,
                     'timestamp': time.time()
                 }
+            self.attempts += 1
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            leader_port = 5000 + Shared.leader_id
-            sock.connect((self.primary_server_host, leader_port))
-            sock.sendall(json.dumps(request).encode())
+            leader_port = 5000 + self.view
+            if self.attempts >= 2:
+                self.broadcast(request)
+            else:
+                self.single_send(request, leader_port)
             self.response_lock = threading.Lock()
             self.condition = threading.Condition(self.response_lock)
             self.wait_for_replies(request=request)
@@ -72,13 +78,26 @@ class PBFTClient():
         finally:
             sock.close()
 
+    def single_send(self, request, port):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect(('localhost', port))
+            sock.send(json.dumps(request).encode())
+        finally:
+            sock.close()
+
+    def broadcast(self, request):
+        for replica_port in list(range(5001, 5001+self.server_counts)):
+            self.single_send(request, replica_port)
+
     def wait_for_replies(self, request, timeout=5):
         """Wait for f+1 responses or timeout"""
         with self.condition:
             self.condition.wait_for(lambda: self.replies_received >= 3, timeout=timeout)
             if self.replies_received >= 3:
-                print(f"Client {self.client_id}: f+1 of replies received.")
                 self.replies_received = 0
+                self.attempts = 0
+                print(f"Client {self.client_id}: f+1 of replies received within view {self.view}.")
             else:
                 print(f"Client {self.client_id}: Timeout reached, Resending the request!")
                 self.replies_received = 0
