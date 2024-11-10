@@ -45,8 +45,6 @@ class PBFTClient():
 
     def handle_reply(self, request):
         with self.response_lock:
-            if request['reply'] == 'no':
-                return
             self.replies_received += 1
             if self.replies_received >= 3:
                 self.view = request['v']
@@ -97,9 +95,9 @@ class PBFTClient():
             if self.replies_received >= 3:
                 self.replies_received = 0
                 self.attempts = 0
-                print(f"Client {self.client_id}: f+1 of replies received within view {self.view}.")
+                print(f"Client {Shared.get_alphabet_for_number(self.client_id)}: f+1 of replies received within view {self.view}.")
             else:
-                print(f"Client {self.client_id}: Timeout reached, Resending the request!")
+                print(f"Client {Shared.get_alphabet_for_number(self.client_id)}: Timeout reached, Resending the request!")
                 self.replies_received = 0
                 self.send_request(request)
 
