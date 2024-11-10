@@ -25,6 +25,7 @@ class PbftServer:
         self.server_id = server_id
         self.port = port
         self.live_servers = []
+        self.byzantine = []
         self.peers = peers
         self.pending_pbft = False
         self.balances = {key: 10 for key in range(1, NUM_CLIENTS + 1)}
@@ -52,14 +53,16 @@ class PbftServer:
         self.vc_request_timer = None #Timer for tracking the view change request to cancel non-majority reached vc reqs
         self.view_change_pending = False
         self.vc_signatures = []
+        self.new_view_logs = []
+        self.local_logs = []
 
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS transactions
                                (id INTEGER PRIMARY KEY,
                                 sequence_number int,
-                                sender int,
-                                receiver int,
+                                sender TEXT,
+                                receiver TEXT,
                                 amount INTEGER,
                                 view INTEGER,
                                 status TEXT)''')
@@ -78,7 +81,7 @@ class PbftServer:
         new_curstor.execute('''
             INSERT OR IGNORE INTO transactions (id, sequence_number, sender, receiver, amount, view, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (id, n, sender, receiver, amount, v, status))
+        ''', (id, n, Shared.get_alphabet_for_number(sender), Shared.get_alphabet_for_number(receiver), amount, v, status))
             
         if new_curstor.rowcount > 0:
             self.conn.commit()
@@ -95,7 +98,7 @@ class PbftServer:
             self.cursor.execute('''
                 INSERT OR IGNORE INTO transactions (id, sequence_number, sender, receiver, amount, ballot_number, process_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (id, sequence_number, sender, receiver, amount, ballot_number, process_id))
+            ''', (id, sequence_number, Shared.get_alphabet_for_number(sender), Shared.get_alphabet_for_number(receiver), amount, ballot_number, process_id))
 
         self.conn.commit()
         # print(f"Server {self.server_id}: Replaced the datastore with the new given datastore.")
@@ -111,6 +114,16 @@ class PbftServer:
         new_cursor.execute('''SELECT * FROM transactions
                        WHERE status = ?
                        ORDER BY sequence_number ASC''', (status,))
+        transactions = new_cursor.fetchall()
+        new_cursor.close()
+
+        return transactions
+    
+    def get_transactions_by_seq(self, n):
+        new_cursor = self.conn.cursor()
+        new_cursor.execute('''SELECT status FROM transactions
+                       WHERE sequence_number = ?
+                       ''', (n,))
         transactions = new_cursor.fetchall()
         new_cursor.close()
 
@@ -155,12 +168,14 @@ class PbftServer:
             self.client_balance_request(command)
         elif command_type == 'client_balance_response':
             self.client_balance_response(command)
-        elif command_type == 'print_balance':
-            self.client_balance(command)
         elif command_type == 'print_log':
-            self.local_logs()
+            self.logs_dump()
+        elif command_type == 'print_status':
+            self.print_status_by_seq_num(command)
         elif command_type == 'print_db':
             self.db_dump()
+        elif command_type == 'print_view':
+            self.print_view()
         elif command_type == 'performance_request':
             self.performance_request()
         elif command_type == 'performance_response':
@@ -228,7 +243,6 @@ class PbftServer:
                 self.send_message(peer_port, message) 
 
     def initiate_pbft(self, client, transaction):
-        print(f'initiating PBFT by {self.server_id} for trans {transaction}')
         self.pending_pbft = True
         self.message = transaction
         self.signatures = []
@@ -238,7 +252,7 @@ class PbftServer:
         self.accept_majority_reached = False
 
         # Send PRE-PREPARE message to all peers
-        n = PbftServer.assign_n()
+        n = PbftServer.assign_n(transaction)
         d = self.digest(transaction)
         self.view = self.server_id
         self.accepted_number = (self.server_id, n)
@@ -252,6 +266,10 @@ class PbftServer:
             'client': client,
             's': self.get_node_signature(self.server_id)
         }}
+        self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
+        log = f'Sending PP by {self.server_id} for request {transaction}'
+        self.local_logs.append(log)
+        # print(log)
         self.broadcast_message(message)
         self.wait_for_majority()
 
@@ -270,7 +288,9 @@ class PbftServer:
             'i': self.server_id,
             's': self.get_node_signature(self.server_id)
         }}
-        print(f'\nServer {self.server_id}: view change requested for v={new_view} from {dest} for thread {self.view_timer.name}')
+        log = f'\nServer {self.server_id}: view change requested for v={new_view} from {dest}'
+        self.local_logs.append(log)
+        # print(log)
         self.broadcast_message(message, include_self=True)
 
     def handle_view_change(self, message):
@@ -286,6 +306,9 @@ class PbftServer:
                 's': self.get_node_signature(self.server_id)
                 }}
                 # print(f'\nServer {self.server_id}: New view requested by designated node {v}!')
+                self.new_view_logs.append(message)
+                log = f'\nServer {self.server_id}: view change applied for v={v}'
+                self.local_logs.append(log)
                 self.broadcast_message(message, include_self=True)
                 threading.Timer(0.2, self.on_new_view_replaced).start()
 
@@ -293,11 +316,16 @@ class PbftServer:
         self.pending_pbft = False
 
     def handle_new_view(self, message):
+        if self.server_id in Shared.byzantines:
+            return
+
         v = message['v']
         self.view = v
         self.vc_signatures = []
         self.cancel_view_change()
-        print(f'\nServer {self.server_id}: New view applied! v={self.view}')
+        log = f'\nServer {self.server_id}: New view ={self.view} set!'
+        self.local_logs.append(log)
+        print(log)
 
     def reset_view_timer(self, dest):
         if self.vc_request_timer != None:
@@ -337,6 +365,8 @@ class PbftServer:
         d = message['d']
         signature = message['s']
 
+        
+
         if self.accepted_number != None and self.accepted_number != (v, n):
             self.accepted_number = None
             self.accepted_value = None
@@ -346,6 +376,7 @@ class PbftServer:
 
         if isValid:
             self.reset_view_timer('PP')
+
             self.view = v
             self.accepted_number = (v, n)
             # print(f'server {self.server_id} acc num is {self.accepted_number} for n {n}')
@@ -360,18 +391,35 @@ class PbftServer:
             'd': d,
             's': self.get_node_signature(self.server_id),
             }}
+
+            self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
+
+            if self.server_id in Shared.byzantines:
+                self.accepted_number = None
+                self.accepted_value = None
+                return
+            
+            log = f'server {self.server_id} acc num is {self.accepted_number} for n {n}'
+            self.local_logs.append(log)
             self.send_message(leader_port, message)
         else:
-            print('PP Is nottttttttttttttttttttttttttttttt valiiiiiiiiiid')
+            log = f'server {self.server_id} PP was not valid!!!'
+            self.local_logs.append(log)
+            print(log)
 
     def handle_prepare(self, message):
+        if self.server_id in Shared.byzantines:
+            return
+        
+        n = message['n']
         signature = message['s']
         
-        # print(f'Receiving prepare by leader with payload: {message}')
         with self.response_lock:
+            log = f'Receiving prepare by leader:{self.server_id} with payload: {message}'
+            self.local_logs.append(log)
+            # print(log)
             self.majority_responses += 1
             self.signatures.append(signature)
-            # print(f'Receiving prepare by leader with payload: {message}')
             if self.majority_responses >= MAJORITY:
                 # Majority reached, send ACCEPT message
                 start_time = time.time()
@@ -381,9 +429,8 @@ class PbftServer:
                     self.response_lock.acquire()
                 self.majority_reached = True
                 self.majority_responses = 1
-                # print('======================here\n',self.response_lock)
+                self.update_transaction_status(n, 'P')
                 self.condition.notify()
-                # print('======================here\n',self.response_lock)
 
     def wait_for_majority(self, timeout=2):
         """Wait for majority of prepare responses or timeout"""
@@ -397,10 +444,14 @@ class PbftServer:
                 # print('======================here\n',self.response_lock)
                 # if self.response_lock.locked():
                 #     self.response_lock.release()
-                # print(f'send prepare ack for {self.accepted_number}')
+                log = f'Majority reached! send prepare ack for {self.accepted_number}'
+                self.local_logs.append(log)
+                # print(log)
                 self.send_prepare_ack()
             else:
-                print(f"Server {self.server_id}: Timeout reached, aborting PBFT.")
+                log = f"Server {self.server_id}: Timeout reached on collecting prepares, aborting PBFT."
+                self.local_logs.append(log)
+                print(log)
                 self.majority_reached = False 
                 self.majority_responses = 1
 
@@ -426,6 +477,8 @@ class PbftServer:
         isValid = len(signatures) >= MAJORITY and (self.accepted_number != None or self.accepted_number == (v, n))
         if isValid == False:
             return
+        
+        self.update_transaction_status(n, 'P')
 
          # Send Commit message to the collector (leader)
         leader_port = 5000+self.view
@@ -438,6 +491,9 @@ class PbftServer:
             's': self.get_node_signature(self.server_id)
         }}
         self.prepared = (self.accepted_number[0], self.accepted_number[1], self.accepted_value)
+        log = f"Server {self.server_id}: Sending commit request to the leader"
+        self.local_logs.append(log)
+        # print(log)
         self.send_message(leader_port, message)
 
     def wait_for_accepted_majority(self, timeout=3):
@@ -449,10 +505,14 @@ class PbftServer:
                 # Commit the transaction after majority or timeout
                 self.accept_majority_reached = False
                 self.accept_majority_responses = 1
+                log = f"Server {self.server_id}: Majority reached, commit and broadcast commit by leader with msg: {self.message} ."
+                self.local_logs.append(log)
+                # print(log)
                 self.commit_transaction()
-                # print(f"Server {self.server_id}: Majority reached, committing request {self.message} .")
             else:
-                print(f"Server {self.server_id}: Timeout reached for the commit majority!")
+                log = f"Server {self.server_id}: Timeout reached for the commit majority!"
+                self.local_logs.append(log)
+                print(log)
                 self.accept_majority_reached = False
                 self.accept_majority_responses = 1
 
@@ -477,7 +537,7 @@ class PbftServer:
     def commit_transaction(self):
         # Commit the block locally
         start_time = time.time()
-        self.add_transaction_to_datastore(self.message, self.accepted_number, 'C')
+        self.update_transaction_status(self.accepted_number[1], 'C')
         # self.clear_outdated_logs(unique_major_block)
 
         # Update performance metrics
@@ -510,11 +570,14 @@ class PbftServer:
         commited = []
         executed = []
         for trans in transactions:
-            id, n, sender, receiver, amount, view, status = trans
+            id, n, s, r, amount, view, status = trans
+            sender = Shared.get_number_for_alphabet(s)
+            receiver = Shared.get_number_for_alphabet(r)
+            normalized_trans = (id, n, sender, receiver, amount, view, status)
             if status == 'C':
-                commited.append(trans)
+                commited.append(normalized_trans)
             elif status == 'E':
-                executed.append(trans)
+                executed.append(normalized_trans)
 
         if len(commited) == 0:
             self.reply_client(client_id, 'yes')
@@ -523,19 +586,28 @@ class PbftServer:
         for commit in commited:
             last_exec_n = 0 if len(executed) == 0 else executed[-1][1]
             id, n, sender, receiver, amount, view, status = commit
-            if last_exec_n + 1 <= n:
-                print(f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})")
-                self.balances[sender] -= amount
-                self.balances[receiver] += amount
+            if last_exec_n + 1 == n:
+                log = f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})"
+                self.local_logs.append(log)
+                # print(log)
                 executed.append(commit)
-                self.update_transaction_status(n, 'E')
-                self.reply_client(sender, 'yes')
+                if self.balances[sender] - amount < 0:
+                    self.update_transaction_status(n, 'Insufficient funds!')
+                    self.reply_client(sender, 'no')
+                else:
+                    self.balances[sender] -= amount
+                    self.balances[receiver] += amount
+                    self.update_transaction_status(n, 'E')
+                    self.reply_client(sender, 'yes')
             else:
                 self.reset_view_timer('Else C')
 
     def reply_client(self, client_id, msg):
         self.cancel_view_change()
         self.send_message(client_id+8000, message = {'reply': msg, 'v': self.view})
+        log = f"Server {self.server_id}: reply {msg} within view {self.view}"
+        self.local_logs.append(log)
+        # print(log)
 
 
     def handle_commit_ack(self, message):
@@ -545,20 +617,24 @@ class PbftServer:
         n = message['n']
         d = message['d']
         if self.prepared != (v, n, d):
-            # print(f'No Prepared for {self.server_id} with n={n} d={d}!!!!!!!!!!')
+            log = f'No Prepared for {self.server_id} with v={v} n={n} d={d}!!!'
+            self.local_logs.append(log)
+            # print(log)
             return
-        # print(f'messageeeeeeeeeeeeeeeee server {self.server_id}: {message}')
-        # Commit the major block to the datastore
-        self.add_transaction_to_datastore(self.message, self.accepted_number, 'C')
-        # Execution
+        log = f'committing on server {self.server_id}: prepared: {self.prepared}'
+        self.local_logs.append(log)
+        # print(log)
+
+        self.update_transaction_status(self.accepted_number[1], 'C')
+
         client_id = self.message[1][0]
         self.execute_transaction(client_id)
+
         # self.clear_outdated_logs(major_block) 
         self.reset_local_values()
 
-    def assign_n():
-        PbftServer.round_number += 1
-        return PbftServer.round_number
+    def assign_n(t):
+        return t[0]
 
     def digest(self, message):
         value = str(message)
@@ -637,18 +713,29 @@ class PbftServer:
         print(f" - Transactions Committed per Second: {transactions_per_second:.4f}")
 
     # -------- Commands -------- #
-    def client_balance(self, command):
-        client = command['client']
-        if (client == None):
-            print('Wrong request format!')
-        balance = self.calculate_balance(client)
-        print(f'Client {client} balance on server {self.server_id} is {balance}')
+    def logs_dump(self):
+        print()
+        for log in self.local_logs:
+            print(f'{log}')
 
-    def local_logs(self):
-        print(f'Server {self.server_id} local logs:\n{self.transactions_log}')
+    def print_status_by_seq_num(self, command):
+        n = command['n']
+        status = self.get_transactions_by_seq(n)[0]
+        print(f'\nServer {self.server_id}: n={n} status is {status[0]}')
 
     def db_dump(self):
-        print(f'Server {self.server_id} datastore dump:\n{self.get_all_transactions()}')
+        self.cursor.execute(f"PRAGMA table_info(transactions)")
+        columns = [column[1] for column in self.cursor.fetchall()]
+
+        # Print column names
+        if self.server_id in Shared.byzantines:
+            self.calculate_all_balances()
+        label_balances = {Shared.number_to_label[number]: balance for number, balance in self.balances.items() if number in Shared.number_to_label}
+        print("\nColumns:", columns)
+        print(f'Server {self.server_id} datastore dump:\n{label_balances}')
+
+    def print_view(self):
+        print(f'\n printing new views on server {self.server_id}: {self.new_view_logs}')
 
     def performance_request(self):
         self.calculate_performance()
@@ -685,17 +772,36 @@ class PbftServer:
     def find_port(self, sender_id):
         return next((item for item in self.peers if item % 1000 == sender_id), None)
 
+    def calculate_all_balances(self):
+        all_transactions = []
+        datastore = self.get_transactions_by_status('E')
+        for trans in datastore:
+            id, sequence_number, s, r, amount, ballot_number, process_id = trans
+            sender = Shared.get_number_for_alphabet(s)
+            receiver = Shared.get_number_for_alphabet(r)
+            all_transactions.append([sequence_number, [sender, receiver, amount]])
+        sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
+
+        self.balances = {key: 10 for key in range(1, NUM_CLIENTS + 1)}
+
+        for transaction in sorted_transactions:
+            sender, receiver, amount = transaction[1] 
+            self.balances[sender] -= amount
+            self.balances[receiver] += amount
+
     def calculate_balance(self, client):
         all_transactions = []
         datastore = self.get_transactions_by_status('E')
         for trans in datastore:
-            id, sequence_number, sender, receiver, amount, ballot_number, process_id = trans
+            id, sequence_number, s, r, amount, ballot_number, process_id = trans
+            sender = Shared.get_number_for_alphabet(s)
+            receiver = Shared.get_number_for_alphabet(r)
             all_transactions.append([sequence_number, [sender, receiver, amount]])
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
 
         balance = INITIAL_BALANCE
         for transaction in sorted_transactions:
-            sender, receiver, amount = transaction[1]
+            sender, receiver, amount = transaction[1]  
             if sender == client:
                 balance -= amount
             elif receiver == client:
@@ -769,15 +875,17 @@ def read_input_file(filename):
         test_sets = {}
         current_set = None
         live_servers = None
+        byzantines = None
         sequence_number = 0
         for row in reader:
             if row[0]:
                 current_set = int(row[0])
                 live_servers = eval(row[2].replace('S', ''))
+                byzantines = eval(row[3].replace('S', ''))
                 if current_set not in test_sets:
-                    test_sets[current_set] = {'transactions': [], 'live_servers': live_servers}
+                    test_sets[current_set] = {'transactions': [], 'live_servers': live_servers, 'byzantines': byzantines}
             
-            transaction = eval(row[1].replace('S', ''))
+            transaction = eval(Shared.convert_labels_to_keys(row[1]))
             sequence_number += 1
             
             test_sets[current_set]['transactions'].append((sequence_number, transaction))
@@ -798,14 +906,6 @@ def start_server(server_id, port, peers):
     server.start_server()
     return server
 
-def print_balance(client, server_id):
-    server_port = server_id + 5000
-    message = {'command': {
-        'type': 'print_balance',
-        'client': client,
-    }}
-    send_message_to_server(server_port, message)
-
 def print_log(server_id):
     server_port = server_id + 5000
     message = {'command': {
@@ -813,12 +913,29 @@ def print_log(server_id):
     }}
     send_message_to_server(server_port, message)
 
+def print_status(sequence_number):
+    message = {'command': {
+        'type': 'print_status',
+        'n': sequence_number,
+    }}
+    for i in range(1, NUM_SERVERS + 1):
+        server_port = i + 5000
+        send_message_to_server(server_port, message)
+
 def print_db(server_id):
     server_port = server_id + 5000
     message = {'command': {
         'type': 'print_db',
     }}
     send_message_to_server(server_port, message)
+
+def print_view():
+    message = {'command': {
+        'type': 'print_view',
+    }}
+    for i in range(1, NUM_SERVERS + 1):
+        server_port = i + 5000
+        send_message_to_server(server_port, message)
 
 def performance(server_id):
     server_port = server_id + 5000
@@ -860,6 +977,7 @@ for set_number, test_data in test_sets.items():
     print(f"Running Test Set {set_number}...")
     transactions = test_data['transactions']
     live_servers = test_data['live_servers']
+    Shared.byzantines = test_data['byzantines']
     
     for transaction in transactions:
         client_id = transaction[1][0]  # S is the sender, which determines the client
@@ -870,6 +988,7 @@ for set_number, test_data in test_sets.items():
         # print(f"Sending request to client {client_id}")
         client = clients[client_id - 1]
         request = {'transaction': transaction, 'live_servers': live_servers}
+        time.sleep(0.1)
         send_request_to_client(client_id+8000, request)
         # else:
         #     print(f"Server {leader_port} is down, skipping transaction {transaction}")
@@ -878,32 +997,28 @@ for set_number, test_data in test_sets.items():
         user_input = input(
             f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
             "or enter one of the following options:\n"
-            "1.X.Y - Print Balance for Client X on Server Y\n"
-            "2.X - Print Log for Server X\n"
+            "1.X - Print Logs on Server X\n"
+            "2.X - Print Status for Server X\n"
             "3.X - Print DB for Server X\n"
-            "4.X - Performance of Server X\n"
-            "5.X (Bonus) - Aggregated Client X Balance Across All Servers"
+            "4 - Print all -New View- messages\n"
+            "5.X - Performance of Server X\n"
             "Your choice: "
         )
         if user_input == "":
             break  # Move to the next set
         elif user_input.startswith('1.'):
-            try:
-                _, client_id, server_id = map(int, user_input.split('.'))
-                print_balance(client_id, server_id)
-            except ValueError:
-                print("Invalid format for PrintBalance. Use 1.X.Y (e.g., 1.1.2 for client 1 on server 2)")
-        elif user_input.startswith('2.'):
             server_id = int(user_input.split('.')[1])
             print_log(server_id)
+        elif user_input.startswith('2.'):
+            sequence_number = int(user_input.split('.')[1])
+            print_status(sequence_number)
         elif user_input.startswith('3.'):
             server_id = int(user_input.split('.')[1])
             print_db(server_id)
-        elif user_input.startswith('4.'):
+        elif user_input.startswith('4'):
+            print_view()
+        elif user_input.startswith('5.'):
             server_id = int(user_input.split('.')[1])
             performance(server_id)
-        elif user_input.startswith('5.'):
-            client_id = int(user_input.split('.')[1])
-            print_balance_across_servers(client_id)
         else:
             print("Invalid input. Try again.")
