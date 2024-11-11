@@ -1,0 +1,7 @@
+Set Number,Transactions,Live Servers,Byzantine Servers
+1,"(A, I, 8)","[S1, S2, S3, S4, S5, S6, S7]","[S3, S5, S7]"
+,"(J, D, 3)",,
+,"(F, G, 4)",,
+,"(E, B, 5)",,
+,"(C, H, 7)",,
+,"(G, J, 1)",,
