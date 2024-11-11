@@ -1,3 +1,4 @@
+import errno
 import socket
 import threading
 import json
@@ -34,7 +35,7 @@ class PbftServer:
         self.accepted_number = None
         self.prepared = None
         self.message = None
-        self.signatures = []
+        self.prepared_signatures = []
         self.transaction_queue = []
         self.total_transaction_time = 0  # Total time spent processing transactions
         self.total_transactions_committed = 0  # Count of committed transactions
@@ -136,15 +137,18 @@ class PbftServer:
         new_cursor.close()
 
 
-    def start_server(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def start_server(self, init):
+        if init:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.bind_and_listen(server_socket)
+            # Start a thread for accepting client connections
+            threading.Thread(target=self.accept_connections, args=(server_socket,)).start()
+        print(f"Server {self.server_id} started on port {self.port}")
+
+    def bind_and_listen(self, server_socket):
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind(('localhost', self.port))
         server_socket.listen(5)
-        print(f"Server {self.server_id} started on port {self.port}")
-        
-        # Start a thread for accepting client connections
-        threading.Thread(target=self.accept_connections, args=(server_socket,)).start()
 
     def accept_connections(self, server_socket):
         while True:
@@ -245,7 +249,7 @@ class PbftServer:
     def initiate_pbft(self, client, transaction):
         self.pending_pbft = True
         self.message = transaction
-        self.signatures = []
+        self.prepared_signatures = []
         self.majority_responses = 1
         self.majority_reached = False
         self.accept_majority_responses = 1
@@ -267,7 +271,7 @@ class PbftServer:
             's': self.get_node_signature(self.server_id)
         }}
         self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
-        log = f'Sending PP by {self.server_id} for request {transaction}'
+        log = f'Broadcasting PP by leader:{self.server_id} for request {transaction}'
         self.local_logs.append(log)
         # print(log)
         self.broadcast_message(message)
@@ -379,7 +383,6 @@ class PbftServer:
 
             self.view = v
             self.accepted_number = (v, n)
-            # print(f'server {self.server_id} acc num is {self.accepted_number} for n {n}')
             self.accepted_value = d
             self.message = m
              # Send PREPARE message to the collector (leader)
@@ -401,6 +404,7 @@ class PbftServer:
             
             log = f'server {self.server_id} acc num is {self.accepted_number} for n {n}'
             self.local_logs.append(log)
+            # print(log)
             self.send_message(leader_port, message)
         else:
             log = f'server {self.server_id} PP was not valid!!!'
@@ -419,7 +423,7 @@ class PbftServer:
             self.local_logs.append(log)
             # print(log)
             self.majority_responses += 1
-            self.signatures.append(signature)
+            self.prepared_signatures.append(signature)
             if self.majority_responses >= MAJORITY:
                 # Majority reached, send ACCEPT message
                 start_time = time.time()
@@ -430,6 +434,7 @@ class PbftServer:
                 self.majority_reached = True
                 self.majority_responses = 1
                 self.update_transaction_status(n, 'P')
+                self.prepared_signatures.append(self.get_node_signature(self.server_id))
                 self.condition.notify()
 
     def wait_for_majority(self, timeout=2):
@@ -461,7 +466,7 @@ class PbftServer:
                 'type': 'prepare_ack',
                 'v': self.server_id,
                 'n': self.accepted_number[1],
-                'certificate': self.signatures,
+                'certificate': self.prepared_signatures,
             }}
         self.broadcast_message(message)
         self.wait_for_accepted_majority()
@@ -821,7 +826,7 @@ class PbftServer:
         self.accepted_value = None
         self.prepared = None
         self.message = None
-        self.signatures = []
+        self.prepared_signatures = []
     
     def check_balance(self, client):
         self.calculate_balance(client)
@@ -892,18 +897,17 @@ def read_input_file(filename):
     
     return test_sets
 
-def start_client(client_id, port):
+def start_client(client_id, port, init):
     client = PBFTClient(client_id, port, NUM_SERVERS)
-    client.start_client()
-    clients.append(client)
+    client.start_client(init)
 
-def start_server(server_id, port, peers):
-    db_file = f'dbs/server_{server_id}.db'
+def start_server(server_id, port, peers, init, set):
+    db_file = f'dbs/server_{server_id}_{set}.db'
     # Remove the existing database file if it exists
     if os.path.exists(db_file):
         os.remove(db_file)
     server = PbftServer(server_id, port, peers, db_file=db_file)
-    server.start_server()
+    server.start_server(init)
     return server
 
 def print_log(server_id):
@@ -944,49 +948,37 @@ def performance(server_id):
     }}
     send_message_to_server(server_port, message)
 
-def print_balance_across_servers(client):
-    message = {'command': {
-        'type': 'client_balance_request',
-        'client': client
-    }}
-    send_message_to_server(leader_port, message)
-
-
 
 # Main
-clients = []
-for client_id in range(1, NUM_CLIENTS + 1):
-    thread = threading.Thread(target=start_client, args=(client_id, client_id + 8000), daemon=True)
-    thread.start()
-    time.sleep(0.1)
-
-threads = []
-ports = list(range(5001, 5001+NUM_SERVERS))
-for i in range(len(ports)):
-    peers = [port for port in ports if port != ports[i]]
-    try:
-        thread = threading.Thread(target=start_server, args=(i + 1, ports[i], peers), daemon=True)
+def setup(NUM_SERVERS, NUM_CLIENTS, start_client, start_server, init, set):
+    for client_id in range(1, NUM_CLIENTS + 1):
+        thread = threading.Thread(target=start_client, args=(client_id, client_id + 8000, init), daemon=True)
         thread.start()
-        threads.append(thread)
         time.sleep(0.1)
-    except Exception as e:
-        print(f"Error starting server thread: {e}")
+
+    threads = []
+    ports = list(range(5001, 5001+NUM_SERVERS))
+    for i in range(len(ports)):
+        peers = [port for port in ports if port != ports[i]]
+        try:
+            thread = threading.Thread(target=start_server, args=(i + 1, ports[i], peers, init, set), daemon=True)
+            thread.start()
+            threads.append(thread)
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Error starting server thread: {e}")
 
 test_sets = read_input_file('tests/input.csv')
 for set_number, test_data in test_sets.items():
+    setup(NUM_SERVERS, NUM_CLIENTS, start_client, start_server, set_number == 1, set_number)
+
     print(f"Running Test Set {set_number}...")
     transactions = test_data['transactions']
     live_servers = test_data['live_servers']
     Shared.byzantines = test_data['byzantines']
     
     for transaction in transactions:
-        client_id = transaction[1][0]  # S is the sender, which determines the client
-        # leader_port = 5000 + Shared.leader_id
-        
-        # If the server is in the live_servers, send the transaction to that server
-        # if leader_port%1000 in live_servers:
-        # print(f"Sending request to client {client_id}")
-        client = clients[client_id - 1]
+        client_id = transaction[1][0]
         request = {'transaction': transaction, 'live_servers': live_servers}
         time.sleep(0.1)
         send_request_to_client(client_id+8000, request)
