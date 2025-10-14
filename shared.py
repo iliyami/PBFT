@@ -3,6 +3,8 @@ class Shared:
     byzantines = []
     alphabet_dict = {letter: i for i, letter in enumerate(string.ascii_uppercase[:10], start=1)}
     number_to_label = {i: letter for i, letter in enumerate(string.ascii_uppercase[:10], start=1)}
+    
+    REQUEST_TYPE_BALANCE = "balance"
 
     def get_alphabet_for_number(number):
         inverse_dict = {v: k for k, v in Shared.alphabet_dict.items()}

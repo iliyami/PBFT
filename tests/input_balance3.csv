@@ -1,0 +1,13 @@
+Set Number,Transactions,Live Servers,Byzantine Servers
+1,"(A, I, 2)","[S1, S2, S3, S4, S5, S6, S7]","[S2, S3]"
+,"(H, D, 3)",,
+,"(I, G, 2)",,
+,"balance(A)",,
+,"balance(B)",,
+,"(B, E, 1)",,
+,"balance(B)",,
+,"(B, E, 1)",,
+,"balance(B)",,
+,"(B, E, 1)",,
+,"(B, E, 1)",,
+,"balance(B)",,

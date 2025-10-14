@@ -141,7 +141,7 @@ class PbftServer:
                        ORDER BY sequence_number ASC''', (status,))
         transactions = new_cursor.fetchall()
         new_cursor.close()
-
+        
         return transactions
     
     def get_transactions_by_seq(self, n):
@@ -155,6 +155,16 @@ class PbftServer:
     
     def update_transaction_status(self, sequence_number, new_status):
         new_cursor = self.conn.cursor()
+        
+        new_cursor.execute("SELECT status FROM transactions WHERE sequence_number = ?", (sequence_number,))
+        current_status = new_cursor.fetchone()
+        
+        if current_status:
+            current_status = current_status[0]
+            if current_status == 'E' and new_status in ['P', 'C']:
+                new_cursor.close()
+                return
+        
         new_cursor.execute("UPDATE transactions SET status = ? WHERE sequence_number = ?", (new_status, sequence_number))
         self.conn.commit()
         new_cursor.close()
@@ -185,8 +195,45 @@ class PbftServer:
             self.handle_transaction(request)
         elif 'pbft' in request:
             self.handle_pbft_message(request['pbft'])
-        elif'command' in request:
+        elif 'command' in request:
             self.handle_commands(request['command'])
+        elif 'request_type' in request and request['request_type'] == Shared.REQUEST_TYPE_BALANCE:
+            threading.Thread(target=self.handle_balance_request, args=(request, conn)).start()
+
+    def handle_balance_request(self, request, conn):
+        """Handle read-only balance requests that bypass consensus"""
+        if self.server_id in Shared.byzantines:
+            print(f"Server {self.server_id}: Byzantine server - not responding to balance request")
+            return
+            
+        client_info = request['client']
+        balance_query = request['balance_query']
+        client_to_query = balance_query['client_id']
+        
+        current_balance = self.calculate_balance(client_to_query)
+        
+        reply = {
+            'balance_reply': {
+                'client_id': client_to_query,
+                'balance': current_balance,
+                'server_id': self.server_id,
+                'query_id': balance_query['query_id']
+            }
+        }
+        
+        try:
+            client_port = client_to_query + 8000
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect(('localhost', client_port))
+            client_socket.send(json.dumps(reply).encode())
+            client_socket.close()
+            
+            log = f"Server {self.server_id}: Sent balance reply for client {Shared.get_alphabet_for_number(client_to_query)}: {current_balance}"
+            self.local_logs.append(log)
+        except Exception as e:
+            print(f"Server {self.server_id}: Error sending balance reply: {e}")
+        finally:
+            conn.close()
 
     # ------------- PBFT Phases ----------------- #
     def handle_commands(self, command):
@@ -337,6 +384,7 @@ class PbftServer:
                 self.new_view_logs.append(message)
                 log = f'\nServer {self.server_id}: view change applied for v={v}'
                 self.local_logs.append(log)
+                # print(log)
                 self.broadcast_message(message, include_self=True)
 
     def handle_new_view(self, message):
@@ -559,21 +607,21 @@ class PbftServer:
 
 
     def handle_commit(self, message):
+        d = message['d']
+        n = message['n']
+        v = message['v']
+        s = message['s']
         with self.accept_response_lock:
-                d = message['d']
-                n = message['n']
-                v = message['v']
-                s = message['s']
-                if (v, n) != self.accepted_number or d != self.accepted_value:
-                    return
-                
-                self.accept_majority_responses += 1
-                # print(f"Server {self.server_id}: Received commit request with s {s}")
+            if (v, n) != self.accepted_number or d != self.accepted_value:
+                return
+            
+            self.accept_majority_responses += 1
+            # print(f"Server {self.server_id}: Received commit request with s {s}")
 
-                if self.accept_majority_responses >= MAJORITY:
-                    self.accept_majority_reached = True
-                    self.accept_condition.notify()
-                    # print(f"Server {self.server_id}: Reached majority, committing request {message}")
+            if self.accept_majority_responses >= MAJORITY:
+                self.accept_majority_reached = True
+                self.accept_condition.notify()
+                # print(f"Server {self.server_id}: Reached majority, committing request {message}")
 
     def commit_transaction(self, is_super=False):
         # Commit the block locally
@@ -906,6 +954,40 @@ def send_request_to_client(client_port, request):
     finally:
         peer_socket.close()
 
+def generate_signature(server_id):
+    """Generate a simple signature for a server/client ID"""
+    value = str(server_id)
+    hash_object = hashlib.sha256(value.encode())
+    hash_hex = hash_object.hexdigest()
+    return hash_hex
+
+def send_balance_request_to_client(client_port, client_to_query):
+    peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        peer_socket.connect(('localhost', client_port))
+        
+        # Create balance request
+        request = {
+            'request_type': Shared.REQUEST_TYPE_BALANCE,
+            'client': {
+                'id': client_to_query,
+                'signature': generate_signature(client_to_query),
+                'timestamp': time.time()
+            },
+            'balance_query': {
+                'client_id': client_to_query,
+                'query_id': int(time.time() * 1000)
+            }
+        }
+        
+        peer_socket.send(json.dumps(request).encode())
+    except ConnectionRefusedError:
+        print(f"Error: Could not connect to client on port {client_port}. Is the client running?")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+    finally:
+        peer_socket.close()
+
 def send_message_to_server(server_port, message):
     try:
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -933,12 +1015,16 @@ def read_input_file(filename):
                 live_servers = eval(row[2].replace('S', ''))
                 byzantines = eval(row[3].replace('S', ''))
                 if current_set not in test_sets:
-                    test_sets[current_set] = {'transactions': [], 'live_servers': live_servers, 'byzantines': byzantines}
+                    test_sets[current_set] = {'transactions': [], 'balance_requests': [], 'live_servers': live_servers, 'byzantines': byzantines}
             
-            transaction = eval(Shared.convert_labels_to_keys(row[1]))
-            sequence_number += 1
-            
-            test_sets[current_set]['transactions'].append((sequence_number, transaction))
+            if row[1].startswith('balance('):
+                client_letter = row[1][8:-1]
+                client_id = Shared.get_number_for_alphabet(client_letter)
+                test_sets[current_set]['balance_requests'].append((None, client_id))
+            else:
+                transaction = eval(Shared.convert_labels_to_keys(row[1]))
+                sequence_number += 1
+                test_sets[current_set]['transactions'].append((sequence_number, transaction))
     
     return test_sets
 
@@ -1041,18 +1127,31 @@ def run_test_file(input_file, interactive=True, debug=False):
 
         print(f"\nRunning Test Set {set_number}...")
         transactions = test_data['transactions']
+        balance_requests = test_data.get('balance_requests', [])
         live_servers = test_data['live_servers']
         Shared.byzantines = test_data['byzantines']
         
         print(f"Live Servers: {live_servers}")
         print(f"Byzantine Servers: {Shared.byzantines}")
         print(f"Transactions: {len(transactions)}")
+        print(f"Balance Requests: {len(balance_requests)}")
         
+        # Execute transactions first
         for transaction in transactions:
             client_id = transaction[1][0]
             request = {'transaction': transaction, 'live_servers': live_servers}
             time.sleep(0.5)
             send_request_to_client(client_id+8000, request)
+        
+        # Wait for transactions to complete
+        time.sleep(2)
+        
+        # Execute balance requests
+        for balance_request in balance_requests:
+            client_id = balance_request[1]
+            # Send balance request to the client who is requesting their own balance
+            send_balance_request_to_client(client_id + 8000, client_id)
+            time.sleep(2)  # Delay between balance requests to prevent conflicts
         
         if interactive:
             while True:
