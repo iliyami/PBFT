@@ -1,4 +1,4 @@
-Set Number,Transactions,Live Servers,Byzantine Servers
-1,"(A, B, 3)","[S1, S2, S3, S4, S5, S6, S7]","[S1, S5]"
-,"(E, C, 8)",,
-,"(J, D, 10)",,
+Set Number,Transactions,Live Servers,Byzantine Servers,Attack
+1,"(A, B, 3)","[S1, S2, S3, S4, S5, S6, S7]","[S1, S5]","crash"
+,"(E, C, 8)",,,
+,"(J, D, 10)",,,

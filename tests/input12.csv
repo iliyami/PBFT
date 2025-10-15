@@ -1,0 +1,4 @@
+Set Number,Transactions,Live Servers,Byzantine Servers,Attack
+1,"(A, E, 6)","[S1, S2, S3, S4, S5, S6, S7]","[S1, S3]","time;dark(n2)"
+,"(C)",,,
+,"(D, I, 8)",,,

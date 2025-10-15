@@ -1,0 +1,6 @@
+Set Number,Transactions,Live Servers,Byzantine Servers,Attack
+1,"(A, B, 2)","[S1, S2, S3, S4, S5, S6, S7]","[S1]","equivocation(n2,n3)"
+,"(C, D, 3)",,,
+,"(E, F, 1)",,,
+,"(A)",,,
+,"(B)",,,

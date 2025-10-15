@@ -1,6 +1,6 @@
-Set Number,Transactions,Live Servers,Byzantine Servers
-1,"(G, A, 3)","[S1, S3, S4, S5, S6]",[]
-,"(B, J, 8)",,
-,"(B, F, 3)",,
-,"(A, E, 6)",,
-,"(I, C, 1)",,
+Set Number,Transactions,Live Servers,Byzantine Servers,Attack
+1,"(G, A, 3)","[S1, S3, S4, S5, S6]",[],""
+,"(B, J, 8)",,,
+,"(B, F, 3)",,,
+,"(A, E, 6)",,,
+,"(I, C, 1)",,,
