@@ -1,5 +1,5 @@
 from secrets import token_bytes, randbelow
-# from blspy import PrivateKey, AugSchemeMPL  # Commented out due to compatibility issues
+# from blspy import PrivateKey, AugSchemeMPL
 import socket
 import threading
 import json
@@ -202,7 +202,7 @@ class PbftServer:
 
     def handle_balance_request(self, request, conn):
         """Handle read-only balance requests that bypass consensus"""
-        if self.server_id in Shared.byzantines:
+        if self.server_id in Shared.byzantines and "crash" in current_attack_types:
             print(f"Server {self.server_id}: Byzantine server - not responding to balance request")
             return
             
@@ -314,6 +314,11 @@ class PbftServer:
         live_ports = [server + 5000 for server in self.live_servers if server != self.server_id]
         if include_self:
             live_ports.append(self.server_id+5000)
+        
+        if self.server_id in Shared.byzantines and dark_target_nodes:
+            live_ports = [port for port in live_ports if (port - 5000) not in dark_target_nodes]
+            print(f"Server {self.server_id} (Byzantine): Avoiding sending messages to nodes {dark_target_nodes}")
+        
         for peer_port in live_ports:
                 self.send_message(peer_port, message) 
 
@@ -332,6 +337,11 @@ class PbftServer:
         self.view = self.server_id
         self.accepted_number = (self.server_id, n)
         self.accepted_value = d
+        
+        if self._handle_equivocation_attack(n, d, transaction, client):
+            return
+        
+        # Normal behavior
         message = {'pbft': {
             'type': 'preprepare',
             'v': self.view,
@@ -388,7 +398,7 @@ class PbftServer:
                 self.broadcast_message(message, include_self=True)
 
     def handle_new_view(self, message):
-        if self.server_id in Shared.byzantines:
+        if self.server_id in Shared.byzantines and "crash" in current_attack_types:
             return
 
         v = message['v']
@@ -449,7 +459,17 @@ class PbftServer:
         #     self.accepted_number = None
         #     self.accepted_value = None
 
-        isValid = v == self.view and d == self.digest(m) and signature == self.get_node_signature(v) and (
+        import hashlib
+        value = str(v)
+        hash_object = hashlib.sha256(value.encode())
+        hash_hex = hash_object.hexdigest()
+        
+        if v in Shared.byzantines and "sign" in current_attack_types:
+            expected_signature = hash_hex + "_INVALID_BYZANTINE"
+        else:
+            expected_signature = hash_hex
+            
+        isValid = v == self.view and d == self.digest(m) and signature == expected_signature and (
             self.accepted_number == None or (self.accepted_number == (v, n) and self.accepted_value == d))
 
         if isValid:
@@ -474,8 +494,8 @@ class PbftServer:
             }}
 
             self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
-
-            if self.server_id in Shared.byzantines:
+            
+            if self.server_id in Shared.byzantines and "crash" in current_attack_types:
                 self.accepted_number = None
                 self.accepted_value = None
                 return
@@ -491,11 +511,22 @@ class PbftServer:
             print(log)
 
     def handle_prepare(self, message):
-        if self.server_id in Shared.byzantines:
+        if self.server_id in Shared.byzantines and "crash" in current_attack_types:
             return
         
         n = message['n']
         signature = message['s']
+        sender_id = message['i']
+        
+        import hashlib
+        value = str(sender_id)
+        hash_object = hashlib.sha256(value.encode())
+        hash_hex = hash_object.hexdigest()
+        
+        expected_signature = hash_hex
+        
+        if signature != expected_signature:
+            return
         
         with self.response_lock:
             log = f'Receiving prepare by leader:{self.server_id} with payload: {message}'
@@ -556,6 +587,9 @@ class PbftServer:
 
 
     def handle_prepare_ack(self, message):
+        if self.server_id in Shared.byzantines and "crash" in current_attack_types:
+            return
+            
         if self.server_id not in Shared.byzantines:
             self.reset_view_timer('Prepare Ack')
 
@@ -565,6 +599,11 @@ class PbftServer:
 
         isValid = len(signatures) >= MAJORITY and (self.accepted_number != None or self.accepted_number == (v, n))
         if isValid == False:
+            return
+        
+        if self.server_id in Shared.byzantines and "sign" in current_attack_types:
+            self.accepted_number = None
+            self.accepted_value = None
             return
         
         self.update_transaction_status(n, 'P')
@@ -699,7 +738,7 @@ class PbftServer:
 
 
     def handle_commit_ack(self, message):
-        if self.server_id in Shared.byzantines:
+        if self.server_id in Shared.byzantines and "crash" in current_attack_types:
             return
         
         self.reset_view_timer('C')
@@ -727,6 +766,51 @@ class PbftServer:
 
     def assign_n(t):
         return t[0]
+    
+    def _handle_equivocation_attack(self, n, d, transaction, client):
+        """Handle equivocation Byzantine attack - returns True if attack was handled"""
+        if self.server_id not in Shared.byzantines or self.view != self.server_id:
+            return False
+            
+        for attack in current_attack_types:
+            if attack.startswith("equivocation("):
+                targets_str = attack[13:-1]
+                if not targets_str:
+                    return False
+                    
+                target_nodes = [int(node.strip()[1:]) for node in targets_str.split(',')]  # Remove 'n' prefix
+                n1, n2 = n, n + 1
+                
+                print(f"Server {self.server_id} (Byzantine Leader): Equivocation attack - sending seq {n1} to nodes {target_nodes}, seq {n2} to others")
+                
+                for target_node in target_nodes:
+                    if target_node in self.live_servers and target_node != self.server_id:
+                        self._send_preprepare_message(target_node, n1, d, transaction, client)
+                
+                for server_id in self.live_servers:
+                    if server_id != self.server_id and server_id not in target_nodes:
+                        self._send_preprepare_message(server_id, n2, d, transaction, client)
+                
+                self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
+                log = f'Equivocation PP by leader:{self.server_id} for request {transaction}'
+                self.local_logs.append(log)
+                self.wait_for_majority()
+                return True
+                
+        return False
+    
+    def _send_preprepare_message(self, target_server, sequence_num, digest, transaction, client):
+        """Helper method to send pre-prepare message"""
+        message = {'pbft': {
+            'type': 'preprepare',
+            'v': self.view,
+            'n': sequence_num,
+            'd': digest,
+            'm': transaction,
+            'client': client,
+            's': self.get_node_signature(self.server_id)
+        }}
+        self.send_message(target_server + 5000, message)
 
     def digest(self, message):
         value = str(message)
@@ -738,6 +822,11 @@ class PbftServer:
         value = str(server_id)
         hash_object = hashlib.sha256(value.encode())
         hash_hex = hash_object.hexdigest()
+        
+        if self.server_id in Shared.byzantines and "sign" in current_attack_types:
+            invalid_sig = hash_hex + "_INVALID_BYZANTINE"
+            return invalid_sig
+        
         return hash_hex
     
     def clear_outdated_logs(self, major_block):
@@ -862,6 +951,10 @@ class PbftServer:
     # -------- Helper Methods -------- #
 
     def generate_partial_signature(self, message_digest):
+        if self.server_id in Shared.byzantines and "sign" in current_attack_types:
+            invalid_partial = str(self.key_share) + "_INVALID_PARTIAL"
+            return invalid_partial
+        
         return self.key_share
 
     def verify_threshold_signature(self, threshold_signature, message_digest):
@@ -925,6 +1018,12 @@ class PbftServer:
         self.calculate_balance(client)
 
     def send_message(self, peer_port, message):
+        if self.server_id in Shared.byzantines and self.view == self.server_id:
+            if "time" in current_attack_types:
+                delay_ms = 100  # Fraction of view_timeout = 8, view_cancel_timeout = 3, and wait_for_majority(timeout=3)
+                print(f"Server {self.server_id} (Byzantine Leader): Delaying message for {delay_ms}ms")
+                time.sleep(delay_ms / 1000.0)
+        
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             peer_socket.connect(('localhost', peer_port))
@@ -1008,17 +1107,25 @@ def read_input_file(filename):
         current_set = None
         live_servers = None
         byzantines = None
+        attack_type = None
         sequence_number = 0
         for row in reader:
             if row[0]:
                 current_set = int(row[0])
                 live_servers = eval(row[2].replace('S', ''))
                 byzantines = eval(row[3].replace('S', ''))
+                attack_type = row[4] if len(row) > 4 else ""
                 if current_set not in test_sets:
-                    test_sets[current_set] = {'transactions': [], 'balance_requests': [], 'live_servers': live_servers, 'byzantines': byzantines}
+                    test_sets[current_set] = {
+                        'transactions': [], 
+                        'balance_requests': [], 
+                        'live_servers': live_servers, 
+                        'byzantines': byzantines,
+                        'attack_type': attack_type
+                    }
             
-            if row[1].startswith('balance('):
-                client_letter = row[1][8:-1]
+            if row[1].startswith('(') and ',' not in row[1] and row[1].endswith(')'):
+                client_letter = row[1][1:-1]
                 client_id = Shared.get_number_for_alphabet(client_letter)
                 test_sets[current_set]['balance_requests'].append((None, client_id))
             else:
@@ -1112,6 +1219,39 @@ def calculate_expected_balances(transactions):
     
     return balances
 
+def configure_byzantine_behavior(attack_type):
+    """Configure Byzantine behavior based on attack type from test file"""
+    global current_attack_types, dark_target_nodes
+    
+    if not attack_type:
+        current_attack_types = []
+        dark_target_nodes = []
+        return
+    
+    # Parse multiple attack types (semicolon-separated)
+    current_attack_types = [attack.strip() for attack in attack_type.split(';')]
+    dark_target_nodes = []  # Reset for each test
+    
+    for attack in current_attack_types:
+        if attack == "sign":
+            print(f"Configuring invalid signature Byzantine behavior")
+        elif attack == "crash":
+            print(f"Configuring crash Byzantine behavior")
+        elif attack.startswith("time"):
+            print(f"Configuring timing Byzantine behavior: {attack}")
+        elif attack.startswith("dark("):
+            # Extract target nodes once globally
+            targets_str = attack[5:-1]  # Remove "dark(" and ")"
+            if targets_str:
+                dark_target_nodes = [int(node.strip()[1:]) for node in targets_str.split(',')]  # Remove 'n' prefix
+                print(f"Configuring in-dark Byzantine behavior: {attack} -> target nodes: {dark_target_nodes}")
+            else:
+                print(f"Configuring in-dark Byzantine behavior: {attack}")
+        elif attack.startswith("equivocation("):
+            print(f"Configuring equivocation Byzantine behavior: {attack}")
+        else:
+            print(f"Unknown attack type: {attack}")
+
 def run_test_file(input_file, interactive=True, debug=False):
     """Run a single test file"""
     print(f"\n{'='*60}")
@@ -1119,7 +1259,7 @@ def run_test_file(input_file, interactive=True, debug=False):
     print(f"{'='*60}")
     
     test_sets = read_input_file(input_file)
-    global key_shares
+    global key_shares, current_attack_types, dark_target_nodes
     key_shares = generate_key_shares(token_bytes(32), NUM_SERVERS, threshold)
     
     for set_number, test_data in test_sets.items():
@@ -1130,11 +1270,16 @@ def run_test_file(input_file, interactive=True, debug=False):
         balance_requests = test_data.get('balance_requests', [])
         live_servers = test_data['live_servers']
         Shared.byzantines = test_data['byzantines']
+        attack_type = test_data.get('attack_type', '')
         
         print(f"Live Servers: {live_servers}")
         print(f"Byzantine Servers: {Shared.byzantines}")
+        print(f"Attack Type: {attack_type if attack_type else 'None'}")
         print(f"Transactions: {len(transactions)}")
         print(f"Balance Requests: {len(balance_requests)}")
+        
+        # Configure Byzantine behavior based on attack type
+        configure_byzantine_behavior(attack_type)
         
         # Execute transactions first
         for transaction in transactions:
