@@ -78,6 +78,8 @@ class PbftServer:
         self.vc_signatures = {}
         self.new_view_logs = []
         self.local_logs = []
+        self.new_view_created_for_view = None  # Track if new-view message has been created for a view
+        self.processed_new_views = set()  # Track which views we've already processed new-view messages for
         self.key_share = key_share
         self.public_key = None
         
@@ -278,6 +280,11 @@ class PbftServer:
         transaction = payload['transaction']
         self.live_servers = payload['live_servers']
 
+        # If this server is not live, it should be idle and not process transactions
+        # View change will be triggered by timeout on backup nodes
+        if self.server_id not in self.live_servers:
+            return  # Server is not live, remain idle
+
         if self.view != self.server_id:
             self.view_timer = threading.Timer(self.view_timeout, self.view_change_request, args=('I', ))
             self.view_timer.start()
@@ -407,15 +414,44 @@ class PbftServer:
             }
             min_s = 0
         
+        # Collect prepared requests (status 'P' or 'C' but not 'E')
+        prepared_requests = []
+        prepared_transactions = self.get_transactions_by_status('P')
+        committed_transactions = self.get_transactions_by_status('C')
+        
+        # Combine prepared and committed (but not executed) transactions
+        all_prepared = {}
+        for trans in prepared_transactions + committed_transactions:
+            id, n, s, r, amount, view, status = trans
+            sender = Shared.get_number_for_alphabet(s)
+            receiver = Shared.get_number_for_alphabet(r)
+            transaction = (sender, receiver, amount)
+            # Reconstruct the full transaction format: (id, (sender, receiver, amount))
+            full_transaction = (id, transaction)
+            digest = self.digest(full_transaction)
+            
+            # Store by sequence number to avoid duplicates
+            if n not in all_prepared:
+                all_prepared[n] = {
+                    'n': n,
+                    'v': view,
+                    'd': digest,
+                    'm': full_transaction,
+                    'status': status
+                }
+        
+        prepared_requests = list(all_prepared.values())
+        
         message = {'pbft': {
             'type': 'view_change',
             'v': new_view,
             'n': min_s,  # Last stable checkpoint sequence (BONUS: enables recovery)
             'C': checkpoint_cert,  # BONUS: Include checkpoint certificate for recovery
+            'P': prepared_requests,  # Prepared requests that need to be reprocessed
             'i': self.server_id,
             's': self.get_node_signature(self.server_id)
         }}
-        log = f'\nServer {self.server_id}: [BONUS-CHECKPOINT] view change requested for v={new_view} from {dest} with checkpoint n={min_s}'
+        log = f'\nServer {self.server_id}: [BONUS-CHECKPOINT] view change requested for v={new_view} from {dest} with checkpoint n={min_s}, {len(prepared_requests)} prepared requests'
         self.local_logs.append(log)
         print(log)
         self.broadcast_message(message, include_self=True)
@@ -423,29 +459,109 @@ class PbftServer:
     def handle_view_change(self, message):
         v = message['v']
         i = message['i']
+        
         if self.server_id == v:
             self.vc_signatures[i] = message
-            if len(self.vc_signatures) >= F + 1:
+            
+            if len(self.vc_signatures) >= F + 1 and self.new_view_created_for_view != v:
+                # Set flag IMMEDIATELY to prevent race condition (multiple threads creating new-view)
+                self.new_view_created_for_view = v
+                
+                # Extract min_s from view-change messages (should be consistent, take max to be safe)
+                min_s_values = [vc_msg.get('n', 0) for vc_msg in self.vc_signatures.values()]
+                min_s = max(min_s_values) if min_s_values else 0
+                
+                # Extract checkpoint certificate from view-change messages
+                checkpoint_certs = [vc_msg.get('C') for vc_msg in self.vc_signatures.values() if 'C' in vc_msg and vc_msg.get('C')]
+                if checkpoint_certs:
+                    # Take the checkpoint with highest sequence number
+                    checkpoint_cert = max(checkpoint_certs, key=lambda c: c.get('sequence_number', 0) if isinstance(c, dict) else 0)
+                else:
+                    checkpoint_cert = None
+                
+                # Collect all prepared requests from view-change messages
+                # A request should be included if it appears in at least f+1 view-change messages (smart optimization)
+                prepared_requests_by_seq = {}  # sequence_number -> {count, request_data}
+                
+                for vc_msg in self.vc_signatures.values():
+                    if 'P' in vc_msg and vc_msg['P']:
+                        for prep_req in vc_msg['P']:
+                            seq_n = prep_req['n']
+                            if seq_n not in prepared_requests_by_seq:
+                                prepared_requests_by_seq[seq_n] = {
+                                    'count': 0,
+                                    'n': prep_req['n'],
+                                    'v': prep_req['v'],
+                                    'd': prep_req['d'],
+                                    'm': prep_req['m']
+                                }
+                            prepared_requests_by_seq[seq_n]['count'] += 1
+                
+                # Create pre-prepare messages for requests that appear in at least f+1 view-change messages
+                O = []  # Set of pre-prepare messages for the new view
+                for seq_n, prep_data in prepared_requests_by_seq.items():
+                    if prep_data['count'] >= F + 1:
+                        # Create pre-prepare message for this request in the new view
+                        # Reconstruct client info from transaction (sender is the client)
+                        transaction = prep_data['m']
+                        id, (sender, receiver, amount) = transaction
+                        
+                        # Create basic client info (we don't have original client info, so reconstruct)
+                        client_info = {
+                            'id': sender,
+                            'signature': generate_signature(sender),
+                            'timestamp': time.time()
+                        }
+                        
+                        pre_prepare_msg = {
+                            'v': v,  # New view
+                            'n': prep_data['n'],  # Same sequence number
+                            'd': prep_data['d'],  # Same digest
+                            'm': transaction,  # Transaction
+                            'client': client_info,
+                            's': self.get_node_signature(self.server_id)
+                        }
+                        O.append(pre_prepare_msg)
+                
                 message = {'pbft': {
                 'type': 'new_view',
                 'v': v,
                 'v_signatures': self.vc_signatures.copy(),
-                # 'O': self.O
+                'O': O,  # Pre-prepare messages for requests to process in new view
+                'min_s': min_s,  # Minimum sequence number from checkpoint
                 's': self.get_node_signature(self.server_id)
                 }}
+                
+                # Include checkpoint certificate if present (BONUS feature)
+                if checkpoint_cert:
+                    message['pbft']['C'] = checkpoint_cert
+                
                 self.new_view_logs.append(message)
-                log = f'\nServer {self.server_id}: view change applied for v={v}'
+                log = f'\nServer {self.server_id}: view change applied for v={v} with {len(O)} pre-prepare messages in O field, min_s={min_s}'
+                if checkpoint_cert:
+                    log += f', checkpoint_cert sequence={checkpoint_cert.get("sequence_number", 0)}'
                 self.local_logs.append(log)
-                # print(log)
+                print(log)
                 self.broadcast_message(message, include_self=True)
 
     def handle_new_view(self, message):
         if self.server_id in Shared.byzantines and "crash" in current_attack_types:
             return
 
+        # Message is already unwrapped (handle_pbft_message extracts request['pbft'])
         v = message['v']
+        
+        # Ignore duplicate new-view messages for the same view (already processed)
+        if v in self.processed_new_views:
+            return
+        
+        # Mark this view as processed
+        self.processed_new_views.add(v)
+        
+        # Set view FIRST before any checkpoint restoration
         self.view = v
         self.vc_signatures = {}
+        self.new_view_created_for_view = None  # Reset flag when view changes
         self.cancel_view_change()
         self.accepted_number = None
         self.accepted_value = None
@@ -462,10 +578,38 @@ class PbftServer:
             # Restore from checkpoint if this replica is behind
             latest_checkpoint = self.get_latest_stable_checkpoint()
             if not latest_checkpoint or checkpoint_cert['sequence_number'] > latest_checkpoint.get('sequence_number', -1):
-                self.restore_from_checkpoint(checkpoint_cert)
-                log = f'Server {self.server_id}: [BONUS-CHECKPOINT] Restored from checkpoint n={checkpoint_cert["sequence_number"]}'
-                self.local_logs.append(log)
-                print(log)
+                # Restore checkpoint but preserve the new view (don't overwrite view from checkpoint)
+                try:
+                    self.restore_from_checkpoint(checkpoint_cert, preserve_view=True)
+                    log = f'Server {self.server_id}: [BONUS-CHECKPOINT] Restored from checkpoint n={checkpoint_cert["sequence_number"]}'
+                    self.local_logs.append(log)
+                    print(log)
+                except Exception as e:
+                    import traceback
+                    print(traceback.format_exc())
+                    raise
+        
+        # Process 'O' field: pre-prepare messages for requests to process in new view
+        if 'O' in message and message['O']:
+            O = message['O']
+            log = f'Server {self.server_id}: Processing {len(O)} pre-prepare messages from new-view O field'
+            self.local_logs.append(log)
+            print(log)
+            
+            for idx, pre_prepare_msg in enumerate(O):
+                # Process each pre-prepare message to reprocess prepared requests
+                # Convert to the format expected by handle_pre_prepare
+                pbft_message = {
+                    'type': 'preprepare',
+                    'v': pre_prepare_msg['v'],
+                    'n': pre_prepare_msg['n'],
+                    'd': pre_prepare_msg['d'],
+                    'm': pre_prepare_msg['m'],
+                    'client': pre_prepare_msg['client'],
+                    's': pre_prepare_msg['s']
+                }
+                # Handle the pre-prepare message (this will trigger the prepare phase)
+                self.handle_pre_prepare(pbft_message)
         
         log = f'\nServer {self.server_id}: New view ={self.view} set!'
         self.local_logs.append(log)
@@ -754,59 +898,73 @@ class PbftServer:
         threading.Timer(0.2, self.handle_consensus_completion).start()
 
     def execute_transaction(self, client_id):
-        transactions = self.get_all_transactions()
-        commited = []
-        executed = []
-        for trans in transactions:
-            id, n, s, r, amount, view, status = trans
-            sender = Shared.get_number_for_alphabet(s)
-            receiver = Shared.get_number_for_alphabet(r)
-            normalized_trans = (id, n, sender, receiver, amount, view, status)
-            if status == 'C':
-                commited.append(normalized_trans)
-            elif status == 'E' or status.startswith('E - '):
-                # Include both successful and failed transactions in executed list
-                # to maintain sequence continuity
-                executed.append(normalized_trans)
+        try:
+            transactions = self.get_all_transactions()
+            commited = []
+            executed = []
+            for trans in transactions:
+                id, n, s, r, amount, view, status = trans
+                sender = Shared.get_number_for_alphabet(s)
+                receiver = Shared.get_number_for_alphabet(r)
+                normalized_trans = (id, n, sender, receiver, amount, view, status)
+                if status == 'C':
+                    commited.append(normalized_trans)
+                elif status == 'E' or status.startswith('E - '):
+                    # Include both successful and failed transactions in executed list
+                    # to maintain sequence continuity
+                    executed.append(normalized_trans)
 
-        # Debug: Log execution state
-        if len(commited) > 0:
-            log = f"Server {self.server_id}: Executing transactions - {len(commited)} committed, {len(executed)} already executed"
-            self.local_logs.append(log)
-            print(log)
-
-        if len(commited) == 0:
-            self.reply_client(client_id, 'yes')
-            return
-
-        for commit in commited:
-            last_exec_n = 0 if len(executed) == 0 else executed[-1][1]
-            id, n, sender, receiver, amount, view, status = commit
-            if last_exec_n + 1 == n:
-                log = f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})"
+            # Debug: Log execution state
+            if len(commited) > 0:
+                log = f"Server {self.server_id}: Executing transactions - {len(commited)} committed, {len(executed)} already executed"
                 self.local_logs.append(log)
-                print(log)
-                executed.append(commit)
-                if self.balances[sender] - amount < 0:
-                    self.update_transaction_status(n, 'E - Insufficient funds!')
-                    self.reply_client(sender, 'no')
-                else:
-                    self.balances[sender] -= amount
-                    self.balances[receiver] += amount
-                    self.update_transaction_status(n, 'E')
-                    self.reply_client(sender, 'yes')
-                
-                # BONUS FEATURE: Check if we should create a checkpoint after execution
-                self.check_checkpoint_trigger(n)
-            elif self.view != self.server_id:
-                self.reset_view_timer('Else C')
+
+            if len(commited) == 0:
+                self.reply_client(client_id, 'yes')
+                return
+
+            for commit in commited:
+                last_exec_n = 0 if len(executed) == 0 else executed[-1][1]
+                id, n, sender, receiver, amount, view, status = commit
+                if last_exec_n + 1 == n:
+                    log = f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})"
+                    self.local_logs.append(log)
+                    print(log)
+                    executed.append(commit)
+                    if self.balances[sender] - amount < 0:
+                        self.update_transaction_status(n, 'E - Insufficient funds!')
+                        self.reply_client(sender, 'no')
+                    else:
+                        self.balances[sender] -= amount
+                        self.balances[receiver] += amount
+                        self.update_transaction_status(n, 'E')
+                        self.reply_client(sender, 'yes')
+                    
+                    # BONUS FEATURE: Check if we should create a checkpoint after execution
+                    self.check_checkpoint_trigger(n)
+                elif self.view != self.server_id:
+                    self.reset_view_timer('Else C')
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            raise
 
     def reply_client(self, client_id, msg):
-        self.cancel_view_change()
-        self.send_message(client_id+8000, message = {'reply': msg, 'v': self.view})
-        log = f"Server {self.server_id}: reply {msg} within view {self.view} for client:{client_id}"
-        self.local_logs.append(log)
-        # print(log)
+        try:
+            self.cancel_view_change()
+            
+            client_port = client_id + 8000
+            reply_message = {'reply': msg, 'v': self.view}
+            
+            self.send_message(client_port, message=reply_message)
+            
+            log = f"Server {self.server_id}: reply {msg} within view {self.view} for client:{client_id}"
+            self.local_logs.append(log)
+            # print(log)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            raise
 
 
     def handle_commit_ack(self, message):
@@ -1204,20 +1362,60 @@ class PbftServer:
         latest_seq = max(self.stable_checkpoints.keys())
         return self.stable_checkpoints[latest_seq]
 
-    def restore_from_checkpoint(self, checkpoint_data):
+    def restore_from_checkpoint(self, checkpoint_data, preserve_view=False):
         """Restore replica state from checkpoint data"""
-        self.balances = checkpoint_data['balances'].copy()
-        self.view = checkpoint_data['view']
+        try:
+            balances = checkpoint_data['balances']
+            # Convert string keys to integers if needed (JSON serialization converts int keys to strings)
+            if balances and isinstance(list(balances.keys())[0] if balances else None, str):
+                self.balances = {int(k): v for k, v in balances.items()}
+            else:
+                self.balances = balances.copy()
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            raise
         
-        # Restore executed transactions to database
-        self.cursor.execute('DELETE FROM transactions')
-        for trans in checkpoint_data['executed_transactions']:
-            id, sequence_number, sender, receiver, amount, view, status = trans
-            self.cursor.execute('''
-                INSERT INTO transactions (sequence_number, sender, receiver, amount, view, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (sequence_number, sender, receiver, amount, view, status))
-        self.conn.commit()
+        # Only restore view if not preserving it (e.g., when called from new-view, view comes from new-view message)
+        if not preserve_view:
+            self.view = checkpoint_data['view']
+        
+        # Use a new cursor to avoid recursive cursor issues
+        new_cursor = self.conn.cursor()
+        try:
+            new_cursor.execute('DELETE FROM transactions')
+            
+            executed_transactions = checkpoint_data.get('executed_transactions', [])
+            
+            if executed_transactions is None:
+                executed_transactions = []
+            
+            for idx, trans in enumerate(executed_transactions):
+                try:
+                    if not isinstance(trans, (tuple, list)):
+                        continue
+                    
+                    if len(trans) != 7:
+                        continue
+                    
+                    id, sequence_number, sender, receiver, amount, view, status = trans
+                    
+                    new_cursor.execute('''
+                        INSERT INTO transactions (sequence_number, sender, receiver, amount, view, status)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (sequence_number, sender, receiver, amount, view, status))
+                except Exception as e:
+                    import traceback
+                    print(traceback.format_exc())
+                    raise
+            
+            self.conn.commit()
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            raise
+        finally:
+            new_cursor.close()
         
         log = f'Server {self.server_id}: Restored from checkpoint sequence {checkpoint_data["sequence_number"]}'
         self.local_logs.append(log)
@@ -1244,8 +1442,18 @@ class PbftServer:
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             peer_socket.connect(('localhost', peer_port))
-            peer_socket.send(json.dumps(message).encode())
+            
+            message_json = json.dumps(message)
+            peer_socket.send(message_json.encode())
+        except ConnectionRefusedError as e:
+            # Log any errors during message sending
+            if 'pbft' in message and message['pbft'].get('type') == 'checkpoint':
+                log = f"Server {self.server_id}: [ERROR] Failed to send checkpoint to port {peer_port}: {e}"
+                self.local_logs.append(log)
+                print(log)
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             # Log any errors during message sending
             if 'pbft' in message and message['pbft'].get('type') == 'checkpoint':
                 log = f"Server {self.server_id}: [ERROR] Failed to send checkpoint to port {peer_port}: {e}"
