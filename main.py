@@ -21,6 +21,14 @@ F = (NUM_SERVERS - 1) // 3  # BPFT F
 MAJORITY = 2*F + 1 #BPFT requires majority for prepare*, commit and checkpoint
 threshold = F + 1
 
+# Global debug flag
+DEBUG_MODE = False
+
+def debug_print(*args, **kwargs):
+    """Print debug messages only when DEBUG_MODE is True"""
+    if DEBUG_MODE:
+        print(*args, **kwargs)
+
 def generate_key_shares(secret, n, t):
     secret_key = randbelow(1000000)
     shares = [(secret_key + i) % 1000000 for i in range(n)]
@@ -76,6 +84,7 @@ class PbftServer:
         self.vc_request_timer = None #Timer for tracking the view change request to cancel non-majority reached vc reqs
         self.view_change_pending = False
         self.vc_signatures = {}
+        self.equivocation_targets_by_seq = {}  # sequence_number -> list of server_ids that received pre-prepare
         self.new_view_logs = []
         self.local_logs = []
         self.new_view_created_for_view = None  # Track if new-view message has been created for a view
@@ -84,7 +93,7 @@ class PbftServer:
         self.public_key = None
         
         # Checkpointing variables
-        self.checkpoint_interval = 100  # Create checkpoint every 100 requests
+        self.checkpoint_interval = 10
         self.last_checkpoint_sequence = 0
         self.checkpoints = {}  # sequence_number -> {server_id -> checkpoint_data}
         self.checkpoint_signatures = {}  # sequence_number -> list of signatures
@@ -154,7 +163,7 @@ class PbftServer:
         
         return transactions
     
-    def get_transactions_by_seq(self, n):
+    def get_tx_status_by_seq(self, n):
         all = self.get_all_transactions()
         for trans in all:
             id, seq_num, s, r, amount, view, status = trans
@@ -162,6 +171,15 @@ class PbftServer:
                 return status
 
         return 'X'
+    
+    def get_transaction_by_seq(self, n):
+        """Get the full transaction tuple by sequence number, or None if not found"""
+        all = self.get_all_transactions()
+        for trans in all:
+            id, seq_num, s, r, amount, view, status = trans
+            if n == seq_num:
+                return trans
+        return None
     
     def update_transaction_status(self, sequence_number, new_status):
         new_cursor = self.conn.cursor()
@@ -200,8 +218,7 @@ class PbftServer:
 
     def handle_client(self, conn):
         try:
-            # Increased buffer size to handle large checkpoint messages
-            data = conn.recv(65536).decode()  # 64KB buffer for checkpoint messages
+            data = conn.recv(65536).decode()
             request = json.loads(data)
             if 'transaction' in request:
                 self.handle_transaction(request)
@@ -286,6 +303,7 @@ class PbftServer:
             return  # Server is not live, remain idle
 
         if self.view != self.server_id:
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Setting view timer (timeout={self.view_timeout}s) in handle_transaction")
             self.view_timer = threading.Timer(self.view_timeout, self.view_change_request, args=('I', ))
             self.view_timer.start()
 
@@ -295,10 +313,11 @@ class PbftServer:
         if self.pending_pbft:
             new_request_timestamp = client['timestamp']
             for request in self.transaction_queue:
-                queued_request_timestamp = request['client']['timestamp']
-                if queued_request_timestamp == new_request_timestamp:
-                    # print(f'return extra req={transaction}')
-                    return
+                if 'client' in request and isinstance(request['client'], dict) and 'timestamp' in request['client']:
+                    queued_request_timestamp = request['client']['timestamp']
+                    if queued_request_timestamp == new_request_timestamp:
+                        # print(f'return extra req={transaction}')
+                        return
             
             self.transaction_queue.append(payload)
             # print(f"Server {self.server_id}: PBFT is in progress. Queuing transaction {transaction}.")
@@ -308,8 +327,42 @@ class PbftServer:
         # self.transaction_queue.put(transaction)
         seq_num, trans = transaction
         sender, receiver, amount = trans
+        
+        # Check if the sequence number corresponds to a no-op (stale sequence number from equivocation)
+        # If so, replace it with the next available sequence number
+        if self.view == self.server_id:  # Only leader should do this
+            existing_trans = self.get_transaction_by_seq(seq_num)
+            if existing_trans:
+                id, n, s, r, amt, view, status = existing_trans
+                # Check if it's a no-op (status='E' and sender=0, receiver=0, amount=0)
+                if status == 'E':
+                    sender_num = Shared.get_number_for_alphabet(s) if s else 0
+                    receiver_num = Shared.get_number_for_alphabet(r) if r else 0
+                    # find the next available sequence number (max executed + 1)
+                    executed_transactions = self.get_transactions_by_status('E')
+                    max_seq = 0
+                    for t in executed_transactions:
+                        id, n, s, r, amt, view, status = t
+                        if n > max_seq:
+                            max_seq = n
+                    new_seq = max_seq + 1
+                    debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Detected stale sequence number n={seq_num} (no-op), replacing with n={new_seq}")
+                    # Replace the sequence number in the transaction
+                    # Normalize to tuple-of-tuples format to match what backups will compute digest from
+                    if isinstance(trans, list):
+                        trans_tuple = tuple(trans)
+                    else:
+                        trans_tuple = trans
+                    transaction = (new_seq, trans_tuple)
+                    seq_num = new_seq
+        
         self.check_balance(sender)
-        self.initiate_pbft(client, transaction)
+        
+        # Check if this is a queued equivocation n=2 request
+        equivocation_n2 = payload.get('equivocation_n2', False)
+        equivocation_exclude = payload.get('equivocation_exclude', None)
+        
+        self.initiate_pbft(client, transaction, equivocation_n2=equivocation_n2, equivocation_exclude=equivocation_exclude)
 
 
     def handle_pbft_message(self, pbft_message):
@@ -349,7 +402,7 @@ class PbftServer:
         for peer_port in live_ports:
                 self.send_message(peer_port, message) 
 
-    def initiate_pbft(self, client, transaction):
+    def initiate_pbft(self, client, transaction, equivocation_n2=False, equivocation_exclude=None):
         self.pending_pbft = True
         self.message = transaction
         self.prepared_signatures = []
@@ -360,15 +413,68 @@ class PbftServer:
 
         # Send PRE-PREPARE message to all peers
         n = PbftServer.assign_n(transaction)
-        d = self.digest(transaction)
+        # Normalize transaction to tuple-of-tuples format (matching what backups will receive after JSON)
+        # JSON converts tuples to lists, so we need to ensure consistent format
+        # Backups will convert [3, [1, 10, 1]] to (3, (1, 10, 1)), so we compute digest from that format
+        if isinstance(transaction, list):
+            normalized_transaction = tuple(transaction)
+            if len(normalized_transaction) == 2 and isinstance(normalized_transaction[1], list):
+                normalized_transaction = (normalized_transaction[0], tuple(normalized_transaction[1]))
+        elif isinstance(transaction, tuple) and len(transaction) == 2:
+            # Ensure inner part is also a tuple (not list)
+            if isinstance(transaction[1], list):
+                normalized_transaction = (transaction[0], tuple(transaction[1]))
+            else:
+                normalized_transaction = transaction
+        else:
+            normalized_transaction = transaction
+        d = self.digest(normalized_transaction)
+        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: initiate_pbft - transaction={transaction}, normalized={normalized_transaction}, n={n}, d={d[:8]}...")
         self.view = self.server_id
         self.accepted_number = (self.server_id, n)
         self.accepted_value = d
         
-        if self._handle_equivocation_attack(n, d, transaction, client):
+        # Check if this is a queued equivocation n=2 request
+        if equivocation_n2:
+            # CRITICAL: Update self.message to n=2's transaction (was set to n=1's transaction before)
+            self.message = transaction
+            # Ensure transaction format matches what backups will compute digest from
+            # Backups receive [2, [1, 10, 1]] and convert to (2, (1, 10, 1))
+            # So we need to compute digest from (2, (1, 10, 1)) format
+            if isinstance(transaction, tuple) and len(transaction) == 2:
+                # Ensure inner part is a tuple (not list) to match backup's conversion
+                if isinstance(transaction[1], list):
+                    normalized_transaction = (transaction[0], tuple(transaction[1]))
+                else:
+                    normalized_transaction = transaction
+                # Recompute digest from format that matches backup's computation
+                d = self.digest(normalized_transaction)
+                # Update accepted_value with new digest
+                self.accepted_value = d
+            
+            # Send pre-prepare for n=2 only to nodes NOT in exclude list (i.e., "others")
+            exclude_nodes = equivocation_exclude or []
+            target_servers = [s for s in self.live_servers if s != self.server_id and s not in exclude_nodes]
+            # Store which servers received n=2 for split broadcast of prepare_ack/commit_ack
+            self.equivocation_targets_by_seq[n] = target_servers.copy()
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Sending n={n} pre-prepare to servers {target_servers}, exclude={exclude_nodes}")
+            for server_id in target_servers:
+                self._send_preprepare_message(server_id, n, d, transaction, client)
+            
+            # Add to datastore
+            self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
+            log = f'Equivocation PP by leader:{self.server_id} for queued n={n} request {transaction} (sent to others only)'
+            self.local_logs.append(log)
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Starting wait_for_majority for n={n}, accepted_number={self.accepted_number}")
+            self.wait_for_majority()  # Wait for n=2 to complete
+            return
+        
+        # Pass normalized transaction to equivocation attack handler
+        if self._handle_equivocation_attack(n, d, normalized_transaction, client):
             return
         
         # Normal behavior
+        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Sending normal pre-prepare for n={n}, v={self.view}, transaction={transaction}, digest={d[:8]}...")
         message = {'pbft': {
             'type': 'preprepare',
             'v': self.view,
@@ -415,16 +521,31 @@ class PbftServer:
             min_s = 0
         
         # Collect prepared requests (status 'P' or 'C' but not 'E')
+        # Also include 'PP' status for equivocation detection (pre-prepared but not prepared)
         prepared_requests = []
         prepared_transactions = self.get_transactions_by_status('P')
         committed_transactions = self.get_transactions_by_status('C')
+        preprepared_transactions = self.get_transactions_by_status('PP')  # Include PP for equivocation detection
         
-        # Combine prepared and committed (but not executed) transactions
+        # Combine prepared, committed, and pre-prepared (but not executed) transactions
         all_prepared = {}
-        for trans in prepared_transactions + committed_transactions:
+        for trans in prepared_transactions + committed_transactions + preprepared_transactions:
             id, n, s, r, amount, view, status = trans
-            sender = Shared.get_number_for_alphabet(s)
-            receiver = Shared.get_number_for_alphabet(r)
+            # Handle None values (e.g., for no-op transactions or invalid data)
+            if s is None:
+                sender = 0  # No-op transactions have sender=0
+            elif isinstance(s, (int, float)) and s == 0:
+                sender = 0
+            else:
+                sender = Shared.get_number_for_alphabet(s) if s else 0
+            
+            if r is None:
+                receiver = 0  # No-op transactions have receiver=0
+            elif isinstance(r, (int, float)) and r == 0:
+                receiver = 0
+            else:
+                receiver = Shared.get_number_for_alphabet(r) if r else 0
+            
             transaction = (sender, receiver, amount)
             # Reconstruct the full transaction format: (id, (sender, receiver, amount))
             full_transaction = (id, transaction)
@@ -441,6 +562,11 @@ class PbftServer:
                 }
         
         prepared_requests = list(all_prepared.values())
+        
+        # Debug: Show what prepared requests are being sent
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: view_change_request for v={new_view} - sending {len(prepared_requests)} prepared requests:")
+        for prep_req in prepared_requests:
+            debug_print(f"[DEBUG-EQ]   - n={prep_req['n']}, v={prep_req['v']}, d={prep_req['d'][:8]}..., m={prep_req['m']}, status={prep_req['status']}")
         
         message = {'pbft': {
             'type': 'view_change',
@@ -463,9 +589,15 @@ class PbftServer:
         if self.server_id == v:
             self.vc_signatures[i] = message
             
-            if len(self.vc_signatures) >= F + 1 and self.new_view_created_for_view != v:
+            # Determine quorum threshold: MAJORITY (2f+1) if there's an attack, F+1 otherwise (optimization)
+            global current_attack_types
+            has_attack = current_attack_types and len(current_attack_types) > 0
+            quorum_threshold = MAJORITY if has_attack else F + 1
+            
+            if len(self.vc_signatures) >= quorum_threshold and self.new_view_created_for_view != v:
                 # Set flag IMMEDIATELY to prevent race condition (multiple threads creating new-view)
                 self.new_view_created_for_view = v
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: View change quorum reached: {len(self.vc_signatures)}/{quorum_threshold} (attack={has_attack})")
                 
                 # Extract min_s from view-change messages (should be consistent, take max to be safe)
                 min_s_values = [vc_msg.get('n', 0) for vc_msg in self.vc_signatures.values()]
@@ -483,9 +615,12 @@ class PbftServer:
                 # A request should be included if it appears in at least f+1 view-change messages (smart optimization)
                 prepared_requests_by_seq = {}  # sequence_number -> {count, request_data}
                 
-                for vc_msg in self.vc_signatures.values():
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Collecting prepared requests from {len(self.vc_signatures)} view-change messages")
+                for vc_sender, vc_msg in self.vc_signatures.items():
                     if 'P' in vc_msg and vc_msg['P']:
+                        debug_print(f"[DEBUG-EQ]   View-change from server {vc_sender} contains {len(vc_msg['P'])} prepared requests:")
                         for prep_req in vc_msg['P']:
+                            debug_print(f"[DEBUG-EQ]     - n={prep_req['n']}, v={prep_req['v']}, d={prep_req['d'][:8]}..., m={prep_req['m']}")
                             seq_n = prep_req['n']
                             if seq_n not in prepared_requests_by_seq:
                                 prepared_requests_by_seq[seq_n] = {
@@ -497,14 +632,106 @@ class PbftServer:
                                 }
                             prepared_requests_by_seq[seq_n]['count'] += 1
                 
-                # Create pre-prepare messages for requests that appear in at least f+1 view-change messages
-                O = []  # Set of pre-prepare messages for the new view
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Collected {len(prepared_requests_by_seq)} unique sequence numbers:")
                 for seq_n, prep_data in prepared_requests_by_seq.items():
+                    debug_print(f"[DEBUG-EQ]   - n={seq_n}: count={prep_data['count']}, m={prep_data['m']}, d={prep_data['d'][:8]}...")
+                
+                # Detect equivocation conflicts: same transaction content with different sequence numbers
+                # Group prepared requests by transaction content digest (not including sequence number)
+                # IMPORTANT: Include ALL prepared requests in conflict detection, not just those with count >= F+1
+                # This allows detecting conflicts even if one sequence number doesn't reach the threshold
+                requests_by_tx_digest = {}  # tx_digest -> list of (seq_n, prep_data)
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Analyzing ALL prepared requests for conflicts (including those with count < {F + 1})")
+                for seq_n, prep_data in prepared_requests_by_seq.items():
+                    # Include ALL requests in conflict detection, regardless of count
+                    # Compute digest of transaction content only (without sequence number)
+                    # prep_data['m'] can be (id, (sender, receiver, amount)) or [id, [sender, receiver, amount]]
+                    # We want to compare just (sender, receiver, amount)
+                    transaction = prep_data['m']
+                    tx_content = None
+                    
+                    # Handle both tuple and list formats (JSON serialization converts tuples to lists)
+                    if isinstance(transaction, tuple) and len(transaction) == 2:
+                        tx_content = transaction[1]  # (sender, receiver, amount)
+                    elif isinstance(transaction, list) and len(transaction) == 2:
+                        # Convert list to tuple for consistent digest computation
+                        inner = transaction[1]
+                        if isinstance(inner, list):
+                            tx_content = tuple(inner)  # Convert [sender, receiver, amount] to (sender, receiver, amount)
+                        else:
+                            tx_content = inner
+                    else:
+                        # Fallback: try to extract from stored digest or use stored digest
+                        debug_print(f"[DEBUG-EQ]   n={seq_n} (count={prep_data['count']}): Unexpected transaction format: {transaction}, type={type(transaction)}")
+                        # Use stored digest as fallback (but this won't detect conflicts properly)
+                        tx_digest = prep_data['d']
+                        debug_print(f"[DEBUG-EQ]   n={seq_n} (count={prep_data['count']}): Using stored digest={tx_digest[:8]}... (WARNING: may not detect conflicts)")
+                        if tx_digest not in requests_by_tx_digest:
+                            requests_by_tx_digest[tx_digest] = []
+                        requests_by_tx_digest[tx_digest].append((seq_n, prep_data))
+                        continue
+                    
+                    # Compute digest from transaction content only (without sequence number)
+                    tx_digest = self.digest(tx_content)
+                    debug_print(f"[DEBUG-EQ]   n={seq_n} (count={prep_data['count']}): m={transaction}, tx_content={tx_content}, tx_digest={tx_digest[:8]}...")
+                    
+                    if tx_digest not in requests_by_tx_digest:
+                        requests_by_tx_digest[tx_digest] = []
+                    requests_by_tx_digest[tx_digest].append((seq_n, prep_data))
+                
+                # Identify conflicting sequence numbers (equivocation: same transaction content, different n)
+                conflicting_seqs = set()
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Grouped by tx_digest: {len(requests_by_tx_digest)} unique transaction contents")
+                for tx_d, req_list in requests_by_tx_digest.items():
+                    seq_numbers = [seq_n for seq_n, _ in req_list]
+                    debug_print(f"[DEBUG-EQ]   tx_digest {tx_d[:8]}...: sequence numbers {seq_numbers}")
+                    if len(req_list) > 1:
+                        # Same transaction content with multiple sequence numbers = equivocation conflict
+                        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: *** DETECTED EQUIVOCATION CONFLICT *** - transaction content digest {tx_d[:8]}... appears with sequence numbers {seq_numbers}")
+                        conflicting_seqs.update(seq_numbers)
+                
+                # Create pre-prepare messages for requests that appear in at least f+1 view-change messages
+                # BUT: If a sequence number is part of a conflict, assign no-op to it even if count < F+1
+                O = []  # Set of pre-prepare messages for the new view
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Creating pre-prepare messages for 'O' field (conflicting_seqs={conflicting_seqs})")
+                
+                # First, assign no-op to ALL conflicting sequence numbers (even if count < F+1)
+                for seq_n in conflicting_seqs:
+                    debug_print(f"[DEBUG-EQ] Leader {self.server_id}: *** ASSIGNING NO-OP *** to conflicting sequence number n={seq_n}")
+                    noop_transaction = (seq_n, (0, 0, 0))  # No-op: (n, (sender=0, receiver=0, amount=0))
+                    noop_digest = self.digest(noop_transaction)
+                    debug_print(f"[DEBUG-EQ]   No-op transaction: {noop_transaction}, digest: {noop_digest[:8]}...")
+                    
+                    # Create no-op client info
+                    noop_client_info = {
+                        'id': 0,
+                        'signature': generate_signature(0),
+                        'timestamp': time.time()
+                    }
+                    
+                    noop_pre_prepare_msg = {
+                        'v': v,  # New view
+                        'n': seq_n,  # Conflicting sequence number
+                        'd': noop_digest,  # No-op digest
+                        'm': noop_transaction,  # No-op transaction
+                        'client': noop_client_info,
+                        's': self.get_node_signature(self.server_id)
+                    }
+                    O.append(noop_pre_prepare_msg)
+                
+                # Then, process non-conflicting requests that appear in at least f+1 view-change messages
+                for seq_n, prep_data in prepared_requests_by_seq.items():
+                    # Skip if already assigned no-op (conflicting)
+                    if seq_n in conflicting_seqs:
+                        continue
+                    
+                    # Only include requests that appear in at least f+1 view-change messages
                     if prep_data['count'] >= F + 1:
-                        # Create pre-prepare message for this request in the new view
+                        # Normal case: create pre-prepare message for this request in the new view
                         # Reconstruct client info from transaction (sender is the client)
                         transaction = prep_data['m']
                         id, (sender, receiver, amount) = transaction
+                        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Creating normal pre-prepare for n={seq_n}, transaction={transaction}")
                         
                         # Create basic client info (we don't have original client info, so reconstruct)
                         client_info = {
@@ -522,6 +749,8 @@ class PbftServer:
                             's': self.get_node_signature(self.server_id)
                         }
                         O.append(pre_prepare_msg)
+                
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Created {len(O)} pre-prepare messages for 'O' field ({len([o for o in O if (isinstance(o['m'], tuple) and len(o['m']) == 2 and o['m'][1] == (0, 0, 0)) or (isinstance(o['m'], list) and len(o['m']) == 2 and (o['m'][1] == [0, 0, 0] or o['m'][1] == (0, 0, 0)))])} no-ops, {len([o for o in O if not ((isinstance(o['m'], tuple) and len(o['m']) == 2 and o['m'][1] == (0, 0, 0)) or (isinstance(o['m'], list) and len(o['m']) == 2 and (o['m'][1] == [0, 0, 0] or o['m'][1] == (0, 0, 0))))])} normal)")
                 
                 message = {'pbft': {
                 'type': 'new_view',
@@ -594,9 +823,48 @@ class PbftServer:
             O = message['O']
             log = f'Server {self.server_id}: Processing {len(O)} pre-prepare messages from new-view O field'
             self.local_logs.append(log)
-            print(log)
+            debug_print(f"[DEBUG-EQ] {log}")
             
+            noop_count = 0
+            normal_count = 0
             for idx, pre_prepare_msg in enumerate(O):
+                # Check if this is a no-op
+                # Handle both tuple and list formats (JSON serialization converts tuples to lists)
+                m = pre_prepare_msg['m']
+                is_noop = False
+                if isinstance(m, tuple) and len(m) == 2:
+                    is_noop = m[1] == (0, 0, 0)
+                elif isinstance(m, list) and len(m) == 2:
+                    is_noop = m[1] == [0, 0, 0] or m[1] == (0, 0, 0)
+                
+                if is_noop:
+                    noop_count += 1
+                    seq_n = pre_prepare_msg['n']
+                    v = pre_prepare_msg['v']
+                    debug_print(f"[DEBUG-EQ] Server {self.server_id}: Processing no-op pre-prepare from 'O' field: n={seq_n}, m={m}")
+                    
+                    # Immediately update database: set status to 'E' for this sequence number
+                    # Use existing functions to check and update
+                    current_status = self.get_tx_status_by_seq(seq_n)
+                    
+                    if current_status == 'X':
+                        # Transaction doesn't exist, add it with no-op values and status 'E'
+                        # For no-op: sender=0, receiver=0, amount=0
+                        noop_message = (seq_n, (0, 0, 0))
+                        noop_accepted_number = (v, seq_n)
+                        self.add_transaction_to_datastore(noop_message, noop_accepted_number, 'E')
+                        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Inserted new transaction n={seq_n} with status 'E' (no-op)")
+                    else:
+                        # Transaction exists, update its status to 'E'
+                        self.update_transaction_status(seq_n, 'E')
+                        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Updated existing transaction n={seq_n} to status 'E' (no-op)")
+                    
+                    # Skip processing this no-op through handle_pre_prepare since we've already marked it as executed
+                    continue
+                else:
+                    normal_count += 1
+                    debug_print(f"[DEBUG-EQ] Server {self.server_id}: Processing normal pre-prepare from 'O' field: n={pre_prepare_msg['n']}, m={m}")
+                
                 # Process each pre-prepare message to reprocess prepared requests
                 # Convert to the format expected by handle_pre_prepare
                 pbft_message = {
@@ -609,7 +877,9 @@ class PbftServer:
                     's': pre_prepare_msg['s']
                 }
                 # Handle the pre-prepare message (this will trigger the prepare phase)
-                self.handle_pre_prepare(pbft_message)
+                # self.handle_pre_prepare(pbft_message)
+            
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Processed {noop_count} no-ops and {normal_count} normal pre-prepares from 'O' field")
         
         log = f'\nServer {self.server_id}: New view ={self.view} set!'
         self.local_logs.append(log)
@@ -617,7 +887,10 @@ class PbftServer:
 
     def reset_view_timer(self, dest):
         if self.view_timer == None:
-            return
+            # First time setting view timer for this backup
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Setting initial view timer (timeout={self.view_timeout}s) from {dest}")
+        else:
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Resetting view timer from {dest}")
         self.vc_signatures = {}
         if self.vc_request_timer != None:
             self.vc_request_timer.cancel()
@@ -657,6 +930,17 @@ class PbftServer:
         d = message['d']
         signature = message['s']
         
+        # Convert list to tuple if needed (JSON serialization converts tuples to lists)
+        # Handle nested structures: (n, (sender, receiver, amount))
+        original_m = m
+        if isinstance(m, list):
+            # Convert outer list to tuple
+            m = tuple(m)
+            # Convert inner list (transaction part) to tuple if it exists
+            if len(m) == 2 and isinstance(m[1], list):
+                m = (m[0], tuple(m[1]))
+        
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: handle_pre_prepare - original m={original_m} (type={type(original_m)}), converted m={m} (type={type(m)})")
 
         # if self.accepted_number != None and self.accepted_number != (v, n):
         #     self.accepted_number = None
@@ -672,10 +956,35 @@ class PbftServer:
         else:
             expected_signature = hash_hex
             
-        isValid = v == self.view and d == self.digest(m) and signature == expected_signature and (
-            self.accepted_number == None or (self.accepted_number == (v, n) and self.accepted_value == d))
+        # Debug: Check each validation condition
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Received pre-prepare for n={n}, v={v}, self.view={self.view}, accepted_number={self.accepted_number}, transaction={m}")
+        view_match = v == self.view
+        computed_d = self.digest(m)
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Digest comparison - received d={d[:8]}..., computed d={computed_d[:8]}... from m={m}")
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Digest match={d == computed_d}, str(m)={str(m)}")
+        digest_match = d == computed_d
+        signature_match = signature == expected_signature
+        accepted_check = self.accepted_number == None or (self.accepted_number == (v, n) and self.accepted_value == d)
+        
+        isValid = view_match and digest_match and signature_match and accepted_check
+
+        if not isValid:
+            reasons = []
+            if not view_match:
+                reasons.append(f"view mismatch (msg v={v}, self.view={self.view})")
+            if not digest_match:
+                reasons.append(f"digest mismatch (expected {d[:8]}..., got {computed_d[:8]}...)")
+            if not signature_match:
+                reasons.append("signature mismatch")
+            if not accepted_check:
+                reasons.append(f"accepted_number conflict (self.accepted_number={self.accepted_number}, expected (v={v}, n={n}))")
+            
+            log = f'server {self.server_id} PP was not valid!!! Reasons: {", ".join(reasons)}'
+            self.local_logs.append(log)
+            debug_print(f"[DEBUG-EQ] {log}")
 
         if isValid:
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: ACCEPTED pre-prepare for n={n}, v={v}, d={d[:8]}...")
             self.reset_view_timer('PP')
 
             partial_signature = self.generate_partial_signature(d)
@@ -697,6 +1006,7 @@ class PbftServer:
             }}
 
             self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Sending PREPARE for n={n} to leader {self.view}")
             
             if self.server_id in Shared.byzantines and "crash" in current_attack_types:
                 self.accepted_number = None
@@ -734,10 +1044,11 @@ class PbftServer:
         with self.response_lock:
             log = f'Receiving prepare by leader:{self.server_id} with payload: {message}'
             self.local_logs.append(log)
-            # print(log)
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Received PREPARE from server {sender_id} for n={n}, count={self.majority_responses + 1}/{MAJORITY}")
             self.majority_responses += 1
             self.prepared_signatures.append(signature)
             if self.majority_responses >= MAJORITY:
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: MAJORITY REACHED for n={n}! ({self.majority_responses}/{MAJORITY})")
                 # Majority reached, send ACCEPT message
                 start_time = time.time()
                 while time.time() - start_time < 0.6:
@@ -754,8 +1065,10 @@ class PbftServer:
         """Wait for majority of prepare responses or timeout"""
         with self.condition:
             # Wait until a majority is reached or the timeout occurs
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Waiting for majority (timeout={timeout}s), current count={self.majority_responses}")
             self.condition.wait_for(lambda: self.majority_reached, timeout=timeout)
             if self.majority_reached:
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Majority reached in wait_for_majority for {self.accepted_number}")
                 # print(f"Server {self.server_id}: Majority of promises received, proceeding to send accept.")
                 is_super_majority = self.majority_responses == 3*F+1
                 self.majority_reached = False
@@ -764,28 +1077,46 @@ class PbftServer:
                 self.local_logs.append(log)
                 # print(log)
                 if is_super_majority:
+                    debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Super majority, committing directly")
                     self.commit_transaction(True)
                 else:
+                    debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Normal majority, sending prepare_ack")
                     self.send_prepare_ack()
             else:
                 log = f"Server {self.server_id}: Timeout reached on collecting prepares, aborting PBFT."
                 self.local_logs.append(log)
-                print(log)
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: TIMEOUT in wait_for_majority for {self.accepted_number}, count={self.majority_responses}")
                 self.majority_reached = False 
                 self.majority_responses = 1
+                # Reset and process queued transactions (e.g., equivocation n=2)
+                if self.view == self.server_id and self.transaction_queue:
+                    debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Processing queued transactions after timeout")
+                    threading.Timer(0.2, self.handle_consensus_completion).start()
 
 
     def send_prepare_ack(self):
         if self.accepted_number == None:
             return
         
+        n = self.accepted_number[1]
+        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Sending prepare_ack for n={n} with {len(self.prepared_signatures)} signatures")
         message = {'pbft': {
                 'type': 'prepare_ack',
                 'v': self.server_id,
-                'n': self.accepted_number[1],
+                'n': n,
                 'certificate': self.prepared_signatures,
             }}
-        self.broadcast_message(message)
+        
+        # Check if this is equivocation: only send to servers that received the pre-prepare
+        if n in self.equivocation_targets_by_seq:
+            target_servers = self.equivocation_targets_by_seq[n]
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Equivocation mode - sending prepare_ack for n={n} only to servers {target_servers}")
+            for server_id in target_servers:
+                if server_id in self.live_servers:
+                    self.send_message(server_id + 5000, message)
+        else:
+            # Normal: broadcast to all
+            self.broadcast_message(message)
         self.wait_for_accepted_majority()
 
 
@@ -801,6 +1132,7 @@ class PbftServer:
         n = message['n']
 
         isValid = len(signatures) >= MAJORITY and (self.accepted_number != None or self.accepted_number == (v, n))
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Received prepare_ack for n={n}, signatures={len(signatures)}, isValid={isValid}, accepted_number={self.accepted_number}")
         if isValid == False:
             return
         
@@ -830,9 +1162,12 @@ class PbftServer:
     def wait_for_accepted_majority(self, timeout=3):
         """Wait for majority of accepted responses or timeout"""
         with self.accept_condition:
+            n = self.accepted_number[1] if self.accepted_number else "?"
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Waiting for COMMIT majority for n={n} (timeout={timeout}s)")
             # Wait until a majority of accepted messages is received or the timeout occurs
             self.accept_condition.wait_for(lambda: self.accept_majority_reached, timeout=timeout)
             if self.accept_majority_reached:
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: COMMIT majority reached in wait_for_accepted_majority for n={n}")
                 # Commit the transaction after majority or timeout
                 self.accept_majority_reached = False
                 self.accept_majority_responses = 1
@@ -843,7 +1178,7 @@ class PbftServer:
             else:
                 log = f"Server {self.server_id}: Timeout reached for the commit majority!"
                 self.local_logs.append(log)
-                print(log)
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: TIMEOUT in wait_for_accepted_majority for n={n}, count={self.accept_majority_responses}")
                 self.accept_majority_reached = False
                 self.accept_majority_responses = 1
 
@@ -855,18 +1190,22 @@ class PbftServer:
         s = message['s']
         with self.accept_response_lock:
             if (v, n) != self.accepted_number or d != self.accepted_value:
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Rejected COMMIT for n={n} (accepted_number={self.accepted_number}, d match={d == self.accepted_value})")
                 return
             
             self.accept_majority_responses += 1
-            # print(f"Server {self.server_id}: Received commit request with s {s}")
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Received COMMIT from server {s} for n={n}, count={self.accept_majority_responses}/{MAJORITY}")
 
             if self.accept_majority_responses >= MAJORITY:
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: COMMIT MAJORITY REACHED for n={n}! ({self.accept_majority_responses}/{MAJORITY})")
                 self.accept_majority_reached = True
                 self.accept_condition.notify()
                 # print(f"Server {self.server_id}: Reached majority, committing request {message}")
 
     def commit_transaction(self, is_super=False):
         # Commit the block locally
+        n = self.accepted_number[1] if self.accepted_number else "?"
+        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: COMMITTING transaction n={n} (is_super={is_super})")
         start_time = time.time()
         self.update_transaction_status(self.accepted_number[1], 'C')
         # self.clear_outdated_logs(unique_major_block)
@@ -877,24 +1216,72 @@ class PbftServer:
         self.total_transactions_committed += 1
 
         # Execution
-        client_id = self.message[1][0]
-        self.execute_transaction(client_id)
+        # Get client_id from the committed transaction (not self.message which might be stale)
+        # For equivocation, self.message might still be from n=1 when n=2 commits
+        # Save n and d before execute_transaction might reset accepted_number and accepted_value
+        commit_n = self.accepted_number[1] if self.accepted_number else None
+        commit_d = self.accepted_value  # Save the digest before execute_transaction resets it
+        n = commit_n
+        if n:
+            # Get the transaction from database to get the correct client_id
+            transactions = self.get_all_transactions()
+            client_id = None
+            for trans in transactions:
+                id, seq_n, s, r, amount, view, status = trans
+                if seq_n == n and status == 'C':
+                    # Extract client_id from the transaction (sender is the client)
+                    # Handle None values (e.g., for no-op transactions)
+                    client_id = Shared.get_number_for_alphabet(s) if s else None
+                    if client_id is None:
+                        continue  # Skip if sender is None (no-op transaction)
+                    break
+            # Fallback to self.message if not found in database
+            if client_id is None and self.message:
+                client_id = self.message[1][0]
+        else:
+            # Fallback if no accepted_number
+            client_id = self.message[1][0] if self.message else None
+        
+        if client_id:
+            self.execute_transaction(client_id)
 
-        # Note: Checkpoint triggering is handled in execute_transaction()
 
-        # Broadcast COMMIT_ACK message to all other servers
+        # Broadcast COMMIT_ACK message to all other servers (or split broadcast for equivocation)
+        # Use saved commit_n and commit_d instead of self.accepted_number/self.accepted_value
+        # since execute_transaction may have reset them
+        n = commit_n
+        # Use saved commit_d (the digest that backups have) instead of recomputing from self.message
+        # This ensures the digest matches what backups expect
+        if commit_d is None:
+            commit_d = self.digest(self.message)  # Fallback if commit_d wasn't saved
         message = {
             'pbft': {
                 'type': 'commit_ack',
                 'v': self.view,
-                'n': self.accepted_number[1],
-                'd': self.digest(self.message),
+                'n': n,
+                'd': commit_d,
                 'i': self.server_id,
                 's': self.get_node_signature(self.server_id),
                 'sm': is_super
             }
         }
-        self.broadcast_message(message)
+        
+        # Check if this is equivocation: only send to servers that received the pre-prepare
+        if n in self.equivocation_targets_by_seq:
+            target_servers = self.equivocation_targets_by_seq[n]
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Equivocation mode - sending commit_ack for n={n} only to servers {target_servers}")
+            for server_id in target_servers:
+                if server_id in self.live_servers:
+                    self.send_message(server_id + 5000, message)
+        else:
+            # Normal: broadcast to all
+            debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Broadcasting commit_ack for n={n} to all live servers")
+            self.broadcast_message(message)
+        
+        # Reset accepted_number after execution and sending commit_ack to allow next transaction
+        self.accepted_number = None
+        self.accepted_value = None
+        
         threading.Timer(0.2, self.handle_consensus_completion).start()
 
     def execute_transaction(self, client_id):
@@ -904,8 +1291,9 @@ class PbftServer:
             executed = []
             for trans in transactions:
                 id, n, s, r, amount, view, status = trans
-                sender = Shared.get_number_for_alphabet(s)
-                receiver = Shared.get_number_for_alphabet(r)
+                # Handle None values (e.g., for no-op transactions or invalid data)
+                sender = Shared.get_number_for_alphabet(s) if s else 0
+                receiver = Shared.get_number_for_alphabet(r) if r else 0
                 normalized_trans = (id, n, sender, receiver, amount, view, status)
                 if status == 'C':
                     commited.append(normalized_trans)
@@ -918,32 +1306,57 @@ class PbftServer:
             if len(commited) > 0:
                 log = f"Server {self.server_id}: Executing transactions - {len(commited)} committed, {len(executed)} already executed"
                 self.local_logs.append(log)
+                debug_print(f"[DEBUG-EQ] Server {self.server_id}: execute_transaction - {len(commited)} committed, {len(executed)} executed")
+                debug_print(f"[DEBUG-EQ] Server {self.server_id}: Committed transactions: {[(t[1], t[2], t[3], t[4]) for t in commited]}")
+                debug_print(f"[DEBUG-EQ] Server {self.server_id}: Executed transactions: {[(t[1], t[2], t[3], t[4]) for t in executed]}")
 
             if len(commited) == 0:
+                debug_print(f"[DEBUG-EQ] Server {self.server_id}: No committed transactions to execute")
                 self.reply_client(client_id, 'yes')
                 return
 
+            # Track initial executed count to detect if we executed something new
+            initial_executed_count = len(executed)
+            
             for commit in commited:
                 last_exec_n = 0 if len(executed) == 0 else executed[-1][1]
                 id, n, sender, receiver, amount, view, status = commit
                 if last_exec_n + 1 == n:
-                    log = f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})"
-                    self.local_logs.append(log)
-                    print(log)
-                    executed.append(commit)
-                    if self.balances[sender] - amount < 0:
-                        self.update_transaction_status(n, 'E - Insufficient funds!')
-                        self.reply_client(sender, 'no')
-                    else:
-                        self.balances[sender] -= amount
-                        self.balances[receiver] += amount
+                    # Check if this is a no-op operation (sender=0, receiver=0, amount=0)
+                    is_noop = (sender == 0 and receiver == 0 and amount == 0)
+                    
+                    if is_noop:
+                        log = f"Server {self.server_id}: Processed no-op transaction n = {n}"
+                        self.local_logs.append(log)
+                        debug_print(f"[DEBUG-EQ] {log}")
+                        executed.append(commit)
                         self.update_transaction_status(n, 'E')
-                        self.reply_client(sender, 'yes')
+                        # No-op doesn't modify balances or send reply to client
+                    else:
+                        log = f"Server {self.server_id}: Processed transaction n = {n} ({sender} -> {receiver}: {amount})"
+                        self.local_logs.append(log)
+                        print(log)
+                        executed.append(commit)
+                        if self.balances[sender] - amount < 0:
+                            self.update_transaction_status(n, 'E - Insufficient funds!')
+                            self.reply_client(sender, 'no')
+                        else:
+                            self.balances[sender] -= amount
+                            self.balances[receiver] += amount
+                            self.update_transaction_status(n, 'E')
+                            self.reply_client(sender, 'yes')
                     
                     # BONUS FEATURE: Check if we should create a checkpoint after execution
                     self.check_checkpoint_trigger(n)
                 elif self.view != self.server_id:
                     self.reset_view_timer('Else C')
+            
+            # Reset accepted_number after execution to allow next transaction
+            # This ensures backups can accept the next pre-prepare message
+            # Only reset if we actually executed something new in this call
+            if len(executed) > initial_executed_count:
+                self.accepted_number = None
+                self.accepted_value = None
         except Exception as e:
             import traceback
             print(traceback.format_exc())
@@ -971,30 +1384,60 @@ class PbftServer:
         if self.server_id in Shared.byzantines and "crash" in current_attack_types:
             return
         
-        self.reset_view_timer('C')
-
         v = message['v']
         n = message['n']
         d = message['d']
         sm = message['sm']
+        
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: Received commit_ack for n={n}, v={v}, accepted_number={self.accepted_number}")
+        
+        self.reset_view_timer('C')
+        
+        # This prevents executing n=1 when we receive commit_ack for n=2 (i.e. equivocation attack)
+        if self.accepted_number != (v, n):
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Rejected commit_ack for n={n} (accepted_number={self.accepted_number}, expected (v={v}, n={n}))")
+            return
+        
         if sm == False and self.prepared != (v, n, d):
             log = f'No Prepared for {self.server_id} with v={v} n={n} d={d}!!!'
             self.local_logs.append(log)
-            # print(log)
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Rejected commit_ack - prepared check failed: sm={sm}, self.prepared={self.prepared}, expected (v={v}, n={n}, d={d[:8]}...)")
             return
         log = f'committing on server {self.server_id}: prepared: {self.prepared}'
         self.local_logs.append(log)
-        # print(log)
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: {log}")
 
-        self.update_transaction_status(self.accepted_number[1], 'C')
+        # Use n from message (validated above to match accepted_number)
+        self.update_transaction_status(n, 'C')
 
-        client_id = self.message[1][0]
-        self.execute_transaction(client_id)
+        # Get client_id from the committed transaction (not self.message which might be stale)
+        # For equivocation, self.message might still be from n=1 when n=2 commits
+        transactions = self.get_all_transactions()
+        client_id = None
+        for trans in transactions:
+            id, seq_n, s, r, amount, view, status = trans
+            if seq_n == n and status == 'C':
+                # Extract client_id from the transaction (sender is the client)
+                # Handle None values (e.g., for no-op transactions)
+                client_id = Shared.get_number_for_alphabet(s) if s else None
+                if client_id is None:
+                    continue  # Skip if sender is None (no-op transaction)
+                break
+        # Fallback to self.message if not found in database
+        if client_id is None and self.message:
+            client_id = self.message[1][0] if len(self.message) > 1 and len(self.message[1]) > 0 else None
         
-        # Note: Checkpoint triggering is handled in execute_transaction()
-
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: handle_commit_ack - calling execute_transaction with client_id={client_id} for n={n}")
+        if client_id:
+            self.execute_transaction(client_id)
+        
         # self.clear_outdated_logs(major_block) 
         self.reset_local_values()
+        
+        # Ensure accepted_number is reset after execution to allow next transaction
+        # This is critical for backups to accept the next pre-prepare message
+        self.accepted_number = None
+        self.accepted_value = None
 
     def assign_n(t):
         return t[0]
@@ -1013,20 +1456,44 @@ class PbftServer:
                 target_nodes = [int(node.strip()[1:]) for node in targets_str.split(',')]  # Remove 'n' prefix
                 n1, n2 = n, n + 1
                 
-                print(f"Server {self.server_id} (Byzantine Leader): Equivocation attack - sending seq {n1} to nodes {target_nodes}, seq {n2} to others")
+                print(f"Server {self.server_id} (Byzantine Leader): Equivocation attack - sending seq {n1} to nodes {target_nodes}, will queue n={n2} for others")
                 
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: _handle_equivocation_attack - n={n1}, transaction={transaction}, transaction type={type(transaction)}")
+                if isinstance(transaction, list):
+                    normalized_tx = tuple(transaction)
+                    if len(normalized_tx) == 2 and isinstance(normalized_tx[1], list):
+                        normalized_tx = (normalized_tx[0], tuple(normalized_tx[1]))
+                else:
+                    normalized_tx = transaction
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Normalized transaction={normalized_tx}, digest d={d[:8]}...")
+                recomputed_d = self.digest(normalized_tx)
+                debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Recomputed digest={recomputed_d[:8]}... (matches={d == recomputed_d})")
+                
+                # Send n=1 pre-prepare to target_nodes only
+                # Store which servers received n=1 for split broadcast of prepare_ack/commit_ack
+                self.equivocation_targets_by_seq[n1] = target_nodes.copy()
                 for target_node in target_nodes:
                     if target_node in self.live_servers and target_node != self.server_id:
+                        debug_print(f"[DEBUG-EQ] Leader {self.server_id}: Sending n={n1} pre-prepare to server {target_node} with d={d[:8]}..., transaction={transaction}")
                         self._send_preprepare_message(target_node, n1, d, transaction, client)
                 
-                for server_id in self.live_servers:
-                    if server_id != self.server_id and server_id not in target_nodes:
-                        self._send_preprepare_message(server_id, n2, d, transaction, client)
+                # Queue n=2 as a separate transaction to process after n=1 completes
+                # n=2 will be sent only to "others" (nodes not in target_nodes)
+                n2_transaction = (n2, transaction[1])  # Create transaction tuple with n2 as sequence number
+                n2_payload = {
+                    'client': client,
+                    'transaction': n2_transaction,
+                    'live_servers': self.live_servers,
+                    'equivocation_n2': True,  # Flag to indicate this is equivocation n=2
+                    'equivocation_exclude': target_nodes  # Nodes that already received n=1
+                }
+                self.transaction_queue.append(n2_payload)
                 
+                # Process n=1 normally (add to datastore and wait for majority)
                 self.add_transaction_to_datastore(self.message, self.accepted_number, 'PP')
-                log = f'Equivocation PP by leader:{self.server_id} for request {transaction}'
+                log = f'Equivocation PP by leader:{self.server_id} for request {transaction} (n={n1}), queued n={n2} for others'
                 self.local_logs.append(log)
-                self.wait_for_majority()
+                self.wait_for_majority()  # Wait for n=1 to complete
                 return True
                 
         return False
@@ -1133,7 +1600,7 @@ class PbftServer:
 
     def print_status_by_seq_num(self, command):
         n = command['n']
-        status = self.get_transactions_by_seq(n)
+        status = self.get_tx_status_by_seq(n)
         print(f'\nServer {self.server_id}: n={n} status is {status}')
 
     def db_dump(self):
@@ -1200,8 +1667,11 @@ class PbftServer:
         datastore = self.get_transactions_by_status('E')
         for trans in datastore:
             id, sequence_number, s, r, amount, ballot_number, process_id = trans
-            sender = Shared.get_number_for_alphabet(s)
-            receiver = Shared.get_number_for_alphabet(r)
+            # Handle None values (e.g., for no-op transactions or invalid data)
+            sender = Shared.get_number_for_alphabet(s) if s else 0
+            receiver = Shared.get_number_for_alphabet(r) if r else 0
+            if sender == 0 and receiver == 0 and amount == 0:
+                continue
             all_transactions.append([sequence_number, [sender, receiver, amount]])
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
 
@@ -1217,8 +1687,11 @@ class PbftServer:
         datastore = self.get_transactions_by_status('E')
         for trans in datastore:
             id, sequence_number, s, r, amount, ballot_number, process_id = trans
-            sender = Shared.get_number_for_alphabet(s)
-            receiver = Shared.get_number_for_alphabet(r)
+            # Handle None values (e.g., for no-op transactions or invalid data)
+            sender = Shared.get_number_for_alphabet(s) if s else 0
+            receiver = Shared.get_number_for_alphabet(r) if r else 0
+            if sender == 0 and receiver == 0 and amount == 0:
+                continue
             all_transactions.append([sequence_number, [sender, receiver, amount]])
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
 
@@ -1234,6 +1707,9 @@ class PbftServer:
         return self.balances[client]
 
     def handle_consensus_completion(self):
+        debug_print(f"[DEBUG-EQ] Server {self.server_id}: handle_consensus_completion called, queue length={len(self.transaction_queue)}")
+        if self.transaction_queue:
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Queued transactions: {[(t.get('transaction', '?'), t.get('equivocation_n2', False)) for t in self.transaction_queue]}")
         self.reset_local_values()
         self.pending_pbft = False
         self.process_queued_transactions()
@@ -1263,7 +1739,9 @@ class PbftServer:
             'executed_transactions': self.get_transactions_by_status('E')
         }
         
-        self.checkpoints[sequence_number] = checkpoint_data
+        if sequence_number not in self.checkpoints:
+            self.checkpoints[sequence_number] = {}
+        self.checkpoints[sequence_number][self.server_id] = checkpoint_data
         self.last_checkpoint_sequence = sequence_number
         
         # Broadcast checkpoint message to all replicas
@@ -1303,7 +1781,7 @@ class PbftServer:
         
         log = f'Server {self.server_id}: [BONUS-CHECKPOINT] Received checkpoint from Server {sender_id} for sequence {sequence_number}'
         self.local_logs.append(log)
-        print(log)
+        # print(log)
         
         # Validate signature
         expected_signature = self.get_node_signature(sender_id)
@@ -1465,8 +1943,10 @@ class PbftServer:
     def process_queued_transactions(self):
         if self.transaction_queue:
             payload = self.transaction_queue.pop(0)
-            # print(f"Server {self.server_id}: Processing queued transaction {payload}.")
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: Processing queued transaction {payload.get('transaction', '?')}, equivocation_n2={payload.get('equivocation_n2', False)}")
             self.handle_transaction(payload)
+        else:
+            debug_print(f"[DEBUG-EQ] Server {self.server_id}: No queued transactions to process")
 
     def get_missing_blocks(self):
         return self.get_all_transactions()
@@ -1713,12 +2193,14 @@ def configure_byzantine_behavior(attack_type):
 
 def run_test_file(input_file, interactive=True, debug=False):
     """Run a single test file"""
+    global DEBUG_MODE, key_shares, current_attack_types, dark_target_nodes
+    DEBUG_MODE = debug  # Set global debug flag
+    
     print(f"\n{'='*60}")
     print(f"Running tests from: {input_file}")
     print(f"{'='*60}")
     
     test_sets = read_input_file(input_file)
-    global key_shares, current_attack_types, dark_target_nodes
     key_shares = generate_key_shares(token_bytes(32), NUM_SERVERS, threshold)
     
     for set_number, test_data in test_sets.items():
@@ -1815,6 +2297,7 @@ def run_test_file(input_file, interactive=True, debug=False):
             print(f"{'='*60}")
 
 def main():
+    global DEBUG_MODE
     parser = argparse.ArgumentParser(description='Linear PBFT Consensus Protocol')
     parser.add_argument('--test', '-t', type=str, help='Run specific test file (e.g., input1.csv)')
     parser.add_argument('--all', '-a', action='store_true', help='Run all tests from input1.csv to input10.csv')
@@ -1822,6 +2305,7 @@ def main():
     parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode with automatic DB balance verification')
     
     args = parser.parse_args()
+    DEBUG_MODE = args.debug  # Set global debug flag
     
     if args.all:
         # Run all tests from 1 to 10
