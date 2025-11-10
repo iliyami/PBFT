@@ -1,6 +1,6 @@
 Set Number,Transactions,Live Servers,Byzantine Servers,Attack
-1,"(F, B, 3)","[S1, S2, S3, S4, S5, S6, S7]","[S4, S6]","crash"
-,"(I, J, 1)",,,
-,"(F, I, 7)",,,
-,"(C, D, 6)",,,
-,"(F, A, 2)",,,
+1,"(F, G, 12)","[n1, n2, n3, n4, n5]",[],[]
+,"(G, H, 1)",,,
+,"(H, I, 11)",,,
+,"(I, J, 11)",,,
+,(J),,,
