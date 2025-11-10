@@ -1,3 +1,5 @@
+# Submit
+
 from secrets import token_bytes, randbelow
 # from blspy import PrivateKey, AugSchemeMPL
 import socket
@@ -13,7 +15,6 @@ from client import PBFTClient
 from shared import Shared
 import hashlib
 
-# Constants
 INITIAL_BALANCE = 10
 NUM_SERVERS = 7
 NUM_CLIENTS = 10
